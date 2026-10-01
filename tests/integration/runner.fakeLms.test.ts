@@ -13,6 +13,8 @@ describe('runner against the controlled fake LMS', () => {
   it('reaches human confirmation and safely submits a selected option', async () => {
     const runner = new Runner(); await runner.start(); await waitFor(() => runner.status().state === 'WAITING_FOR_CONFIRMATION');
     const pending = runner.status().pending; expect(pending?.text).toContain('encrypted web traffic'); expect(pending?.options).toHaveLength(3);
-    await runner.confirm('b'); expect(runner.status().state).toBe('PLAYING'); await runner.stop();
-  });
+    expect(runner.status().video?.currentTime).toBeGreaterThanOrEqual(3); expect(runner.status().video?.duration).toBeGreaterThan(10); expect(runner.status().video?.paused).toBe(true);
+    await runner.confirm('b'); expect(runner.status().state).toBe('PLAYING'); expect(runner.status().questionPending).toBe(false); await runner.stop();
+    await expect(runner.confirm('b')).rejects.toMatchObject({ code: 'NO_PENDING_QUESTION' });
+  }, 12_000);
 });
