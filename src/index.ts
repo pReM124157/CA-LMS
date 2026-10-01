@@ -6,3 +6,6 @@ import { databaseHealthy, disconnectDatabase } from './persistence/prisma.js';
 const runner = new Runner(); const server = createApp(runner, databaseHealthy).listen(env.PORT, '0.0.0.0', () => logger.info({ port: env.PORT }, 'LMS Cloud Runner listening'));
 const shutdown = async (): Promise<void> => { await runner.stop(); await disconnectDatabase(); server.close(); };
 process.on('SIGTERM', () => void shutdown()); process.on('SIGINT', () => void shutdown());
+const failClosed = async (event: 'uncaughtException' | 'unhandledRejection'): Promise<void> => { logger.fatal({ event, error: 'PLAYWRIGHT_INTERNAL_FAILURE' }, 'fatal browser/runtime failure; terminating for clean restart'); await runner.failClosed(event).catch(() => undefined); await disconnectDatabase().catch(() => undefined); server.close(() => process.exit(1)); setTimeout(() => process.exit(1), 2_000).unref(); };
+process.on('uncaughtException', () => void failClosed('uncaughtException'));
+process.on('unhandledRejection', () => void failClosed('unhandledRejection'));

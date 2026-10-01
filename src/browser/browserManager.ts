@@ -18,7 +18,7 @@ export class BrowserManager {
       if (Date.now() < this.nextReconnectAt) throw new Error('REMOTE_BROWSER_CONNECTION_FAILED');
       this.status = 'remote_browser_reconnecting';
       try {
-        this.remoteBrowser = await chromium.connectOverCDP(this.remoteBrowserWsUrl);
+        this.remoteBrowser = await chromium.connectOverCDP(this.remoteBrowserWsUrl, { noDefaults: true });
         this.context = this.remoteBrowser.contexts()[0] ?? await this.remoteBrowser.newContext({ viewport: { width: 1440, height: 900 } });
         this.sessionStartedAt = Date.now();
         this.reconnectFailures = 0; this.nextReconnectAt = 0;
@@ -50,6 +50,7 @@ export class BrowserManager {
   sessionAgeSeconds(): number | undefined { return this.sessionStartedAt ? Math.floor((Date.now() - this.sessionStartedAt) / 1000) : undefined; }
   private isAlive(): boolean { return this.remoteBrowser ? this.remoteBrowser.isConnected() : Boolean(this.context?.browser()?.isConnected()); }
   private clearDeadConnection(): void { this.context = undefined; this.remoteBrowser = undefined; this.sessionStartedAt = undefined; }
+  async invalidate(): Promise<void> { const context = this.context; const browser = this.remoteBrowser; this.clearDeadConnection(); this.status = this.remoteBrowserWsUrl ? 'remote_browser_disconnected' : 'local'; await context?.close().catch(() => undefined); await browser?.close().catch(() => undefined); }
 }
 
 export async function testRemoteBrowserConnection(remoteBrowserWsUrl = env.REMOTE_BROWSER_WS_URL): Promise<{ ok: boolean; mode: 'remote' | 'not_configured'; error?: 'REMOTE_BROWSER_CONNECTION_FAILED' }> {
