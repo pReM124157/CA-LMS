@@ -1,32 +1,45 @@
-generator client { provider = "prisma-client-js" }
-datasource db { provider = "postgresql"; url = env("DATABASE_URL") }
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
 
 model Run {
-  id String @id @default(cuid())
-  startedAt DateTime @default(now())
-  endedAt DateTime?
-  status String
+  id           String        @id @default(cuid())
+  startedAt    DateTime      @default(now())
+  endedAt      DateTime?
+  status       String
   currentState String
-  events RunnerEvent[]
+  events       RunnerEvent[]
 }
+
 model RunnerEvent {
-  id String @id @default(cuid())
-  runId String?
-  run Run? @relation(fields: [runId], references: [id])
+  id        String   @id @default(cuid())
+  runId     String?
+  run       Run?     @relation(fields: [runId], references: [id])
   fromState String?
-  toState String
-  reason String
+  toState   String
+  reason    String
   createdAt DateTime @default(now())
 }
+
 model Question {
-  id String @id @default(cuid())
-  hash String @unique
-  questionText String
-  optionsJson Json
+  id                String   @id @default(cuid())
+  hash              String   @unique
+  questionText      String
+  optionsJson       Json
   recommendedAnswer String?
-  confidence Float?
-  provider String?
-  status String @default("PENDING")
-  createdAt DateTime @default(now())
+  confidence        Float?
+  provider          String?
+  status            String   @default("PENDING")
+  createdAt         DateTime @default(now())
 }
-model SystemState { id Int @id @default(1); state String; updatedAt DateTime @updatedAt }
+
+model SystemState {
+  id        Int      @id @default(1)
+  state     String
+  updatedAt DateTime @updatedAt
+}
