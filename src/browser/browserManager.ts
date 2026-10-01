@@ -9,18 +9,24 @@ export class BrowserManager {
   private remoteBrowser?: Browser;
   private sessionStartedAt?: number;
   private status: BrowserConnectionStatus = env.REMOTE_BROWSER_WS_URL ? 'remote_browser_disconnected' : 'local';
+  private reconnectFailures = 0;
+  private nextReconnectAt = 0;
   public constructor(private readonly remoteBrowserWsUrl = env.REMOTE_BROWSER_WS_URL, private readonly dataDir = env.RUNNER_DATA_DIR) {}
   async page(): Promise<Page> {
     if (this.context && !this.isAlive()) this.clearDeadConnection();
     if (!this.context && this.remoteBrowserWsUrl) {
+      if (Date.now() < this.nextReconnectAt) throw new Error('REMOTE_BROWSER_CONNECTION_FAILED');
       this.status = 'remote_browser_reconnecting';
       try {
         this.remoteBrowser = await chromium.connectOverCDP(this.remoteBrowserWsUrl);
         this.context = this.remoteBrowser.contexts()[0] ?? await this.remoteBrowser.newContext({ viewport: { width: 1440, height: 900 } });
         this.sessionStartedAt = Date.now();
+        this.reconnectFailures = 0; this.nextReconnectAt = 0;
         this.status = 'remote_browser_connected';
       } catch {
         this.clearDeadConnection();
+        this.reconnectFailures = Math.min(this.reconnectFailures + 1, 4);
+        this.nextReconnectAt = Date.now() + Math.min(1000 * 2 ** this.reconnectFailures, 8000);
         this.status = 'remote_browser_disconnected';
         throw new Error('REMOTE_BROWSER_CONNECTION_FAILED');
       }
