@@ -6,7 +6,7 @@ A safety-constrained Playwright LMS assistant. It navigates a compatible LMS, us
 
 Working: persistent Playwright browser control, local fake-LMS navigation, question detection and parsing, human-confirmed answer submission, host-gated autosubmit policy, state transitions, and lint/type/unit/browser-integration checks.
 
-Not yet verified: PostgreSQL persistence and runner leases, recovery after crashes, real-LMS selectors, long-duration stability, Docker image execution, and Render deployment. Do not treat this as production-ready until those checks are complete.
+Not yet verified: PostgreSQL persistence and runner leases, recovery after crashes, real-LMS selectors, long-duration stability, Docker image execution, and the remote-browser cloud canary. Do not treat this as production-ready until those checks are complete.
 
 ## Quick start
 

@@ -23,3 +23,17 @@ export class BrowserManager {
   }
   connected(): boolean { return this.remoteBrowser?.isConnected() ?? Boolean(this.context?.browser()?.isConnected()); }
 }
+
+export async function testRemoteBrowserConnection(remoteBrowserWsUrl = env.REMOTE_BROWSER_WS_URL): Promise<{ ok: boolean; mode: 'remote' | 'not_configured'; error?: 'REMOTE_BROWSER_CONNECTION_FAILED' }> {
+  if (!remoteBrowserWsUrl) return { ok: false, mode: 'not_configured' };
+  const manager = new BrowserManager(remoteBrowserWsUrl);
+  try {
+    const page = await manager.page();
+    await page.goto('about:blank');
+    return { ok: true, mode: 'remote' };
+  } catch {
+    return { ok: false, mode: 'remote', error: 'REMOTE_BROWSER_CONNECTION_FAILED' };
+  } finally {
+    await manager.close().catch(() => undefined);
+  }
+}

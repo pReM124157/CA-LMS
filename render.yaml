@@ -2,8 +2,7 @@ services:
   - type: web
     name: lms-cloud-runner
     runtime: node
-    buildCommand: npm ci && npx prisma generate && npm run build
-    preDeployCommand: npx prisma migrate deploy
+    buildCommand: npm ci --include=dev && npx prisma generate && npx prisma migrate deploy && npm run build
     startCommand: npm start
     healthCheckPath: /health
     envVars:

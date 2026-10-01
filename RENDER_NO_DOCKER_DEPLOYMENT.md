@@ -10,7 +10,7 @@ Push this project to a private GitHub repository. Do not commit `.env`, browser 
 
 1. Create a Render PostgreSQL instance.
 2. Create a Node Web Service from the GitHub repository.
-3. Render reads `render.yaml`: build is `npm ci && npx prisma generate && npm run build`; the pre-deploy migration command is `npx prisma migrate deploy`; start is `npm start`.
+3. Use Node 22.x. The verified main-service build command is `npm ci --include=dev && npx prisma generate && npx prisma migrate deploy && npm run build`; start is `node dist/src/index.js`; health path is `/health`.
 4. Add the database's internal connection string as `DATABASE_URL`.
 
 The current runner does not yet persist operational state in PostgreSQL. Do not rely on its local filesystem for critical production state; implement database-backed sessions, questions, events, and a runner lease before production operation.
@@ -23,7 +23,7 @@ With `REMOTE_BROWSER_WS_URL` present, `BrowserManager` uses `chromium.connectOve
 
 ## Render environment variables
 
-Required now: `DATABASE_URL`, `LMS_BASE_URL`, `LMS_LOGIN_URL`, `REMOTE_BROWSER_WS_URL`, `DASHBOARD_USERNAME`, and `DASHBOARD_PASSWORD`.
+Required now: `DATABASE_URL`, `NODE_ENV=production`, `DASHBOARD_USERNAME`, and `DASHBOARD_PASSWORD`. `REMOTE_BROWSER_WS_URL`, `LMS_BASE_URL`, and `LMS_LOGIN_URL` remain optional until the controlled cloud canary is activated.
 
 Safety defaults: `REQUIRE_HUMAN_CONFIRMATION=true`, `AUTO_SUBMIT=false`, and a restrictive `AUTOSUBMIT_ALLOWED_HOSTS`. Never add a third-party production LMS to the autosubmit list.
 
