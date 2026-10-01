@@ -2,7 +2,7 @@
 
 This mode tests external streaming only. It does not navigate to an LMS, scan courses, parse questions, or submit answers.
 
-1. Choose a harmless, public, embeddable YouTube video.
+1. Prefer a harmless 15–30 second operator-owned video uploaded to your own YouTube channel. An unlisted video is acceptable only when **Allow embedding** is enabled.
 2. Copy only its 11-character video ID.
 3. In Render set `TARGET_MODE=youtube_test`, `YOUTUBE_TEST_VIDEO_ID=<id>`, and optionally `YOUTUBE_TEST_MAX_SECONDS=60`.
 4. Deploy, then authenticated `POST /api/runner/start`.
@@ -11,3 +11,5 @@ This mode tests external streaming only. It does not navigate to an LMS, scan co
 7. Restore `TARGET_MODE=fake` after testing.
 
 Some public videos are unavailable, region-blocked, age-restricted, or embedding-disabled. Select another operator-approved public test video if the iframe reports an error.
+
+Error `101` or `150` means the uploader does not allow embedding; it is not a condition the runner may bypass. The controlled page supplies its own HTTPS origin to the IFrame API, uses a route-specific CSP/referrer policy, and stops the runner once on terminal player errors.
