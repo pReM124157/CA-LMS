@@ -78,6 +78,22 @@ describe('ICAI login-only runner', () => {
     expect(mocks.requestOtp).toHaveBeenCalledOnce();
     expect(vi.getTimerCount()).toBe(0);
   });
+  it('halts restored authentication without requesting OTP, solving questions, or polling', async () => {
+    mocks.requestOtp.mockResolvedValue('authenticated');
+    const runner = new Runner();
+    await runner.start();
+    expect(runner.status()).toMatchObject({
+      state: 'PAUSED',
+      active: false,
+      icai: { stage: 'authenticated' },
+    });
+    expect(transitions().slice(-2)).toEqual(['AUTH_REQUIRED->DASHBOARD', 'DASHBOARD->PAUSED']);
+    expect(vi.getTimerCount()).toBe(0);
+    expect(mocks.submitOtp).not.toHaveBeenCalled();
+    expect(mocks.write).not.toHaveBeenCalled();
+    await runner.resume();
+    expect(mocks.requestOtp).toHaveBeenCalledOnce();
+  });
   it('submits OTP in the same session and stops at DASHBOARD/PAUSED without solving or persisting', async () => {
     const runner = new Runner({
       solveQuestion: mocks.solve,

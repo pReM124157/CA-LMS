@@ -181,9 +181,16 @@ export class Runner {
         };
         this.icaiPage = page;
         this.move('AUTH_REQUIRED', 'ICAI login requires human OTP');
-        await this.icaiAdapter.requestOtp(page, env.ICAI_LOGIN_URL, env.ICAI_SRN!);
+        const result = await this.icaiAdapter.requestOtp(page, env.ICAI_LOGIN_URL, env.ICAI_SRN!);
         if (!this.active) return;
         this.currentUrl = ICAI_ORIGIN;
+        if (result === 'authenticated') {
+          this.icai.stage = 'authenticated';
+          this.move('DASHBOARD', 'ICAI restored authenticated dashboard confirmed');
+          this.halt();
+          this.move('PAUSED', 'ICAI login canary finished; manual dashboard inspection');
+          return;
+        }
         this.icai.stage = 'otp_required';
         this.halt();
         this.move('OTP_REQUIRED', 'normal OTP input detected; waiting for operator');

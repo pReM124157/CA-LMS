@@ -13,8 +13,15 @@ export type ICAIErrorCode =
 export type LoginDiagnostics = {
   finalPathname: string;
   httpStatus?: number;
-  inputs: { name: string; id: string; placeholder: string }[];
-  controls: string[];
+  pageTitle: string;
+  relevantText: string[];
+  interactiveElements: {
+    tagName: string;
+    role: string;
+    ariaLabel: string;
+    title: string;
+    visibleText: string;
+  }[];
 };
 export class ICAILoginError extends Error {
   constructor(
@@ -76,45 +83,148 @@ export class ICAITestAdapter {
   private control(page: Page, name: RegExp): Promise<Locator | undefined> {
     return this.visible([page.getByRole('button', { name }), page.getByRole('link', { name })]);
   }
-  async diagnostics(page: Page, secrets: string[]): Promise<LoginDiagnostics> {
-    const raw = await page.evaluate(() => ({
-      inputs: Array.from(document.querySelectorAll('input'))
-        .slice(0, 30)
-        .map((input) => ({
-          name: input.name,
-          id: input.id,
-          placeholder: input.placeholder,
-        })),
-      controls: Array.from(document.querySelectorAll('button, a, input[type="submit"]'))
-        .filter((node) => {
-          const rect = node.getBoundingClientRect();
-          const style = getComputedStyle(node);
+  private async loginControl(page: Page): Promise<Locator | undefined> {
+    // getByText finds the smallest matching node, including Angular div/span content.
+    // Only these exact visible labels authorize a click; SSP is discovery-only.
+    const matches = page.getByText(/^\s*(?:login|log\s+in|sign\s+in|sign-in)\s+with\s+otp\s*$/i);
+    for (let index = 0; index < Math.min(await matches.count(), 40); index++) {
+      let node = matches.nth(index);
+      if (!(await node.isVisible())) continue;
+      for (let depth = 0; depth <= 4; depth++) {
+        const allowed = await node.evaluate((element) => {
+          const text = (element as HTMLElement).innerText?.replace(/\s+/g, ' ').trim() ?? '';
           return (
-            rect.width > 0 &&
-            rect.height > 0 &&
-            style.visibility !== 'hidden' &&
-            style.display !== 'none'
+            /^(?:login|log in|sign in|sign-in) with otp$/i.test(text) &&
+            element.matches('button, a, [role="button"], [role="link"], [tabindex="0"]')
           );
-        })
-        .slice(0, 30)
-        .map((node) => (node.textContent ?? node.getAttribute('aria-label') ?? '').slice(0, 160)),
-    }));
+        });
+        if (allowed && (await node.isVisible())) return node;
+        node = node.locator('xpath=..');
+        if (!(await node.count())) break;
+      }
+    }
+    return undefined;
+  }
+  async authenticated(page: Page): Promise<boolean> {
+    this.assertOrigin(page, 'ICAI_LOGIN_NOT_CONFIRMED');
+    const indicators = [
+      /^self[-\s]paced online module[s]?$/i,
+      /^my learning history$/i,
+      /^dashboard$/i,
+      /^my courses$/i,
+      /^(?:log ?out|sign out)$/i,
+    ];
+    let count = 0;
+    for (const indicator of indicators) {
+      if (await this.visible([page.getByText(indicator)])) count++;
+    }
+    // The pair counts as one independent indicator, never two by itself.
+    if (
+      (await this.visible([page.getByText(/^set a$/i)])) &&
+      (await this.visible([page.getByText(/^set b$/i)]))
+    )
+      count++;
+    return count >= 2;
+  }
+  async diagnostics(page: Page, secrets: string[]): Promise<LoginDiagnostics> {
+    const raw = await page.evaluate(() => {
+      const visible = (node: Element): boolean => {
+        const rect = node.getBoundingClientRect();
+        const style = getComputedStyle(node);
+        return (
+          rect.width > 0 &&
+          rect.height > 0 &&
+          style.visibility !== 'hidden' &&
+          style.visibility !== 'collapse' &&
+          style.display !== 'none' &&
+          style.opacity !== '0'
+        );
+      };
+      // Exclude form/control content even when an interactive ancestor wraps it.
+      const text = (node: Element): string => {
+        if (node.closest('input, textarea, select, script, style, [contenteditable]')) return '';
+        const walker = document.createTreeWalker(node, NodeFilter.SHOW_TEXT);
+        const parts: string[] = [];
+        let count = 0;
+        while (walker.nextNode() && count++ < 200) {
+          const parent = walker.currentNode.parentElement;
+          if (
+            parent &&
+            visible(parent) &&
+            !parent.closest('input, textarea, select, script, style, [contenteditable]')
+          )
+            parts.push(walker.currentNode.textContent ?? '');
+        }
+        return parts.join(' ').replace(/\s+/g, ' ').trim();
+      };
+      const relevant =
+        /login|log in|sign[ -]in|otp|ssp|dashboard|self[- ]paced|learning|courses|logout/i;
+      const snippets = new Set<string>();
+      for (const node of Array.from(document.querySelectorAll('body *')).slice(0, 5000)) {
+        if (!visible(node) || node.matches('script, style, input, textarea, select')) continue;
+        const value = text(node);
+        if (
+          relevant.test(value) &&
+          !Array.from(node.children).some((child) => visible(child) && relevant.test(text(child)))
+        )
+          snippets.add(value.slice(0, 320));
+        if (snippets.size >= 40) break;
+      }
+      return {
+        pageTitle: document.title.slice(0, 320),
+        relevantText: [...snippets],
+        interactiveElements: Array.from(
+          document.querySelectorAll('button, a, [role], [tabindex], [onclick]'),
+        )
+          .filter(visible)
+          .slice(0, 40)
+          .map((node) => ({
+            tagName: node.tagName,
+            role: node.getAttribute('role') ?? '',
+            ariaLabel: (node.getAttribute('aria-label') ?? '').slice(0, 320),
+            title: (node.getAttribute('title') ?? '').slice(0, 320),
+            visibleText: node.matches('input, textarea, select') ? '' : text(node).slice(0, 320),
+          })),
+      };
+    });
+    const configuredSecrets = Object.entries(process.env)
+      .filter(([key]) => /SRN|OTP|TOKEN|SECRET|PASSWORD|API_KEY|AUTHORIZATION/i.test(key))
+      .map(([, value]) => value ?? '');
+    // Browserless credentials may be embedded in the configured WebSocket URL.
+    // Read only configuration here, never cookies, storage, headers or input values.
+    try {
+      const remote = new URL(process.env.REMOTE_BROWSER_WS_URL ?? '');
+      configuredSecrets.push(remote.username, remote.password);
+      for (const [key, value] of remote.searchParams)
+        if (/token|secret|password|key|auth/i.test(key)) configuredSecrets.push(value);
+    } catch {
+      /* No configured remote endpoint. */
+    }
     const clean = (text: string): string => {
       let value = text;
-      for (const secret of secrets) if (secret) value = value.split(secret).join('[REDACTED]');
+      for (const secret of [...secrets, ...configuredSecrets])
+        if (secret) value = value.split(secret).join('[REDACTED]');
       return value
-        .replace(/https?:\/\/\S+|\b[A-Za-z]{3}\d{7}\b|\b\d{4,}\b/g, '[REDACTED]')
+        .replace(/https?:\/\/\S+|\b[A-Za-z]{3}\d{7}\b|\b\d{4,}\b/gi, '[REDACTED]')
+        .replace(
+          /\b(?:token|secret|password|authorization|cookie|srn|otp)\s*[=:]\s*\S+/gi,
+          '[REDACTED]',
+        )
+        .replace(/\S*\?\S+/g, '[REDACTED]')
         .slice(0, 160);
     };
     return {
       finalPathname: clean(new URL(page.url()).pathname),
       ...(this.entryStatus !== undefined ? { httpStatus: this.entryStatus } : {}),
-      inputs: raw.inputs.map((input) => ({
-        name: clean(input.name),
-        id: clean(input.id),
-        placeholder: clean(input.placeholder),
+      pageTitle: clean(raw.pageTitle),
+      relevantText: raw.relevantText.map(clean),
+      interactiveElements: raw.interactiveElements.map((node) => ({
+        tagName: clean(node.tagName),
+        role: clean(node.role),
+        ariaLabel: clean(node.ariaLabel),
+        title: clean(node.title),
+        visibleText: clean(node.visibleText),
       })),
-      controls: raw.controls.map(clean),
     };
   }
   private async missing(page: Page, code: ICAIErrorCode, secrets: string[]): Promise<never> {
@@ -127,8 +237,13 @@ export class ICAITestAdapter {
       this.assertOrigin(page, 'ICAI_LOGIN_PAGE_UNAVAILABLE');
       if (
         (await this.srn(page)) ||
+        (await this.authenticated(page)) ||
+        (await this.loginControl(page)) ||
         (await this.visible([
-          page.getByText(/login with otp|sign in with ssp|(?:ICAI\s+)?digital learning campus/i),
+          page.getByText(
+            /(?:login|log\s+in|sign(?:\s+|-)in)\s+with\s+(?:otp|ssp)|(?:ICAI\s+)?digital learning campus/i,
+          ),
+          page.getByPlaceholder('What do you want to learn?'),
         ]))
       )
         return true;
@@ -150,7 +265,11 @@ export class ICAITestAdapter {
       throw new ICAILoginError('ICAI_LOGIN_PAGE_UNAVAILABLE');
     }
   }
-  async requestOtp(page: Page, loginUrl: string, srn: string): Promise<void> {
+  async requestOtp(
+    page: Page,
+    loginUrl: string,
+    srn: string,
+  ): Promise<'authenticated' | 'otp_required'> {
     try {
       const entry = new URL(loginUrl);
       if (entry.origin !== ICAI_ORIGIN || entry.username || entry.password)
@@ -187,7 +306,8 @@ export class ICAITestAdapter {
       const controlsDeadline = Date.now() + this.spaReadyTimeoutMs;
       do {
         this.assertOrigin(page, 'ICAI_OTP_REQUEST_FAILED');
-        switchControl = await this.control(page, /^(login|sign in) (with|via) otp$/i);
+        if (await this.authenticated(page)) return 'authenticated';
+        switchControl = await this.loginControl(page);
         srnInput = await this.srn(page);
         if (switchControl || srnInput) break;
         await page.waitForTimeout(250);
@@ -203,16 +323,22 @@ export class ICAITestAdapter {
           await page.waitForTimeout(200);
         } while (Date.now() < deadline);
       }
-      if (!srnInput) return this.missing(page, 'ICAI_OTP_UI_NOT_FOUND', [srn]);
+      if (!srnInput) {
+        if (await this.authenticated(page)) return 'authenticated';
+        return this.missing(page, 'ICAI_OTP_UI_NOT_FOUND', [srn]);
+      }
       await srnInput.fill(srn, { timeout });
       const request = await this.control(page, /^(request|send|generate|get) (an? )?otp$/i);
-      if (!request) return this.missing(page, 'ICAI_OTP_UI_NOT_FOUND', [srn]);
+      if (!request) {
+        if (await this.authenticated(page)) return 'authenticated';
+        return this.missing(page, 'ICAI_OTP_UI_NOT_FOUND', [srn]);
+      }
       this.assertOrigin(page, 'ICAI_OTP_REQUEST_FAILED');
       await request.click({ timeout });
       const deadline = Date.now() + timeout;
       while (Date.now() < deadline) {
         this.assertOrigin(page, 'ICAI_OTP_REQUEST_FAILED');
-        if (await this.otp(page)) return;
+        if (await this.otp(page)) return 'otp_required';
         await page.waitForTimeout(200);
       }
       return this.missing(page, 'ICAI_OTP_INPUT_NOT_FOUND', [srn]);

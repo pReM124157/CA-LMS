@@ -84,11 +84,14 @@ const spaFixture = async (
     rootEmpty?: boolean;
     delayMs?: number;
     escape?: boolean;
+    controlMarkup?: string;
+    pageMarkup?: string;
   } = {},
 ): Promise<void> => {
   const form =
     '<form id="srn-form" action="/request" method="post" hidden><label>SRN<input name="srn"></label><button>Generate OTP</button></form>';
   const button =
+    options.controlMarkup ??
     '<button onclick="document.getElementById(\'srn-form\').hidden=false;this.hidden=true">Login with OTP</button>';
   await context.route('**/*', async (route) => {
     const url = new URL(route.request().url());
@@ -114,7 +117,7 @@ const spaFixture = async (
     const body =
       status >= 300 || empty
         ? '<input name="unknown-ABC1234567" placeholder="ABC1234567" value="654321"><button>Help ABC1234567</button>'
-        : rendered;
+        : (options.pageMarkup ?? rendered);
     await route.fulfill({ status, contentType: 'text/html', body });
   });
 };
@@ -135,6 +138,152 @@ describe('controlled ICAI browser and OTP API fixtures', () => {
   });
   afterEach(async () => {
     await context.close();
+  });
+  it.each([
+    '<button onclick="document.getElementById(\'srn-form\').hidden=false;this.hidden=true">Login with OTP</button>',
+    '<div role="button" onclick="document.getElementById(\'srn-form\').hidden=false;this.hidden=true">Log in with OTP</div>',
+    '<div tabindex="0" onclick="document.getElementById(\'srn-form\').hidden=false;this.hidden=true"><span><span> Login   with OTP </span></span></div>',
+    '<div role="link" onclick="document.getElementById(\'srn-form\').hidden=false;this.hidden=true"> Sign-in with OTP </div>',
+    '<button onclick="document.getElementById(\'srn-form\').hidden=false;this.hidden=true"> LOG   IN with otp </button>',
+    '<a onclick="document.getElementById(\'srn-form\').hidden=false;this.hidden=true"><span>sign in with otp</span></a>',
+    '<div role="link" onclick="document.getElementById(\'srn-form\').hidden=false;this.hidden=true">LOG   IN   with   otp</div>',
+  ])('discovers only exact OTP login labels in custom controls: %s', async (controlMarkup) => {
+    await spaFixture({ controlMarkup });
+    expect(
+      await new ICAITestAdapter(500).requestOtp(page, 'https://lms.icai.org/login', 'ABC1234567'),
+    ).toBe('otp_required');
+    expect(requests).toEqual(['/login', '/request']);
+  });
+  it.each([
+    '<button onclick="window.clicked=true">Learn about OTP</button>',
+    '<div role="button" onclick="window.clicked=true">Sign in with SSP</div>',
+    '<div role="button" onclick="window.clicked=true"><span>Login with OTP</span><span>Open course</span></div>',
+    '<div onclick="window.clicked=true">Login with OTP</div>',
+    '<button hidden onclick="window.clicked=true">Login with OTP</button>',
+  ])('never clicks unrelated, hidden or non-actionable OTP/SSP text: %s', async (markup) => {
+    await spaFixture({ pageMarkup: '<h1>ICAI Digital Learning Campus</h1>' + markup });
+    await expect(
+      new ICAITestAdapter(300).requestOtp(page, 'https://lms.icai.org/login', 'ABC1234567'),
+    ).rejects.toMatchObject({ code: 'ICAI_OTP_UI_NOT_FOUND' });
+    expect(
+      await page.evaluate(() => (window as unknown as { clicked?: boolean }).clicked),
+    ).toBeUndefined();
+    expect(requests).toEqual(['/login']);
+  });
+  it('restored authentication goes AUTH_REQUIRED → DASHBOARD → PAUSED without course or video activity', async () => {
+    await spaFixture({
+      pageMarkup:
+        '<h1>Dashboard</h1><a href="/logout">Log Out</a><a href="/course/lecture">Open course</a><video></video><script>window.mediaPlays=0;HTMLMediaElement.prototype.play=function(){window.mediaPlays++;return Promise.resolve()}</script>',
+    });
+    const runner = new Runner();
+    await runner.start();
+    expect(runner.status()).toMatchObject({
+      state: 'PAUSED',
+      active: false,
+      icai: { stage: 'authenticated' },
+    });
+    expect(shared.log.mock.calls.map(([event]) => `${event.from}->${event.to}`).slice(-2)).toEqual([
+      'AUTH_REQUIRED->DASHBOARD',
+      'DASHBOARD->PAUSED',
+    ]);
+    await runner.resume();
+    expect(requests).toEqual(['/']);
+    expect(
+      await page.evaluate(() => (window as unknown as { mediaPlays: number }).mediaPlays),
+    ).toBe(0);
+    expect(shared.write).not.toHaveBeenCalled();
+  });
+  it.each([
+    '<input name="Search" placeholder="What do you want to learn?"><button>Previous</button><button>Next</button>',
+    '<h1>Dashboard</h1><input placeholder="What do you want to learn?">',
+    '<h1>Dashboard</h1><h2>Dashboard</h2><input placeholder="What do you want to learn?">',
+    '<h1>Dashboard</h1><a hidden>Logout</a><input placeholder="What do you want to learn?">',
+  ])(
+    'public search/carousel and fewer than two distinct visible indicators fail closed: %s',
+    async (pageMarkup) => {
+      await spaFixture({ pageMarkup });
+      await expect(
+        new ICAITestAdapter(300).requestOtp(page, 'https://lms.icai.org/login', 'ABC1234567'),
+      ).rejects.toMatchObject({
+        code: 'ICAI_OTP_UI_NOT_FOUND',
+        diagnostic: { finalPathname: '/login', httpStatus: 200 },
+      });
+      expect(requests).toEqual(['/login']);
+    },
+  );
+  it('bounds and redacts diagnostics including custom interactive metadata and relevant text', async () => {
+    const pageMarkup =
+      '<title>Learning ABC1234567 https://example.test/?token=secret-url</title>' +
+      '<p>Learning canary-browserless-secret</p><h1>ICAI Digital Learning Campus</h1><input placeholder="What do you want to learn?" value="private-input-value">' +
+      '<div role="button" tabindex="0" onclick="window.clicked=true" aria-label="OTP token=secret-token" title="SRN ABC1234567">OTP help 654321</div>' +
+      '<script>localStorage.setItem("private", "storage-secret")</script>' +
+      Array.from(
+        { length: 60 },
+        (_, index) => `<button title="Learning">Learning snippet ${index}</button>`,
+      ).join('') +
+      '<div hidden>login hidden-secret</div>';
+    vi.stubEnv('REMOTE_BROWSER_WS_URL', 'wss://browser.test/?token=canary-browserless-secret');
+    await spaFixture({ pageMarkup: pageMarkup + '<p>Learning canary-browserless-secret</p>' });
+    let failure: unknown;
+    try {
+      await new ICAITestAdapter(300).requestOtp(
+        page,
+        'https://lms.icai.org/login?srn=ABC1234567',
+        'ABC1234567',
+      );
+    } catch (error) {
+      failure = error;
+    } finally {
+      vi.unstubAllEnvs();
+    }
+    expect(failure).toMatchObject({
+      code: 'ICAI_OTP_UI_NOT_FOUND',
+      diagnostic: {
+        pageTitle: 'Learning [REDACTED] [REDACTED]',
+        interactiveElements: expect.arrayContaining([
+          expect.objectContaining({
+            tagName: 'DIV',
+            role: 'button',
+            ariaLabel: 'OTP [REDACTED]',
+            title: 'SRN [REDACTED]',
+            visibleText: 'OTP help [REDACTED]',
+          }),
+        ]),
+      },
+    });
+    const diagnostic = (
+      failure as { diagnostic: { relevantText: string[]; interactiveElements: unknown[] } }
+    ).diagnostic;
+    expect(diagnostic.relevantText.length).toBeLessThanOrEqual(40);
+    expect(diagnostic.interactiveElements.length).toBeLessThanOrEqual(40);
+    expect(JSON.stringify(failure)).not.toMatch(
+      /ABC1234567|654321|private-input-value|storage-secret|secret-token|secret-url|hidden-secret|canary-browserless-secret|srn=/,
+    );
+    expect(Object.keys(diagnostic).sort()).toEqual([
+      'finalPathname',
+      'httpStatus',
+      'interactiveElements',
+      'pageTitle',
+      'relevantText',
+    ]);
+    expect(requests).toEqual(['/login']);
+  });
+  it('does not leak textarea or editable values through ancestor diagnostic text', async () => {
+    await spaFixture({
+      pageMarkup:
+        '<h1>ICAI Digital Learning Campus</h1><div role="button">OTP help<textarea>private-textarea-value</textarea><span hidden>hidden-login-value</span><span contenteditable>private-editable-value</span></div>',
+    });
+    let failure: unknown;
+    try {
+      await new ICAITestAdapter(300).requestOtp(page, 'https://lms.icai.org/login', 'ABC1234567');
+    } catch (error) {
+      failure = error;
+    }
+    expect(failure).toMatchObject({ code: 'ICAI_OTP_UI_NOT_FOUND' });
+    expect(JSON.stringify(failure)).not.toMatch(
+      /private-textarea-value|private-editable-value|hidden-login-value/,
+    );
+    expect(requests).toEqual(['/login']);
   });
   it('/login non-2xx falls back once to the root SPA and requests OTP normally', async () => {
     await spaFixture({ loginStatus: 404 });
@@ -177,8 +326,7 @@ describe('controlled ICAI browser and OTP API fixtures', () => {
       diagnostic: {
         finalPathname: '/',
         httpStatus: 503,
-        inputs: [{ name: 'unknown-[REDACTED]', id: '', placeholder: '[REDACTED]' }],
-        controls: ['Help [REDACTED]'],
+        interactiveElements: [{ tagName: 'BUTTON', visibleText: 'Help [REDACTED]' }],
       },
     });
     expect(JSON.stringify(failure)).not.toMatch(/ABC1234567|654321|srn=/);
@@ -284,7 +432,7 @@ describe('controlled ICAI browser and OTP API fixtures', () => {
     }
     expect(diagnostic).toMatchObject({
       code: 'ICAI_OTP_UI_NOT_FOUND',
-      diagnostic: { inputs: [{ name: 'unknown', id: '' }] },
+      diagnostic: { finalPathname: '/missing', httpStatus: 200, pageTitle: '' },
     });
     expect(JSON.stringify(diagnostic)).not.toMatch(
       /ABC1234567|654321|private-value|browser-token-secret/,
