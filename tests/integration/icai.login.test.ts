@@ -398,6 +398,57 @@ describe('controlled ICAI browser and OTP API fixtures', () => {
       /ABC1234567|654321|private-|hidden-value|diagnostic-secret|defaultValue|"value"/,
     );
   });
+  it('prefers LOGIN over Generate OTP in the SRN form and stops without course or video activity', async () => {
+    const prototype = Object.getPrototypeOf(page.locator('body'));
+    const normalClick = prototype.click;
+    const labels: string[] = [];
+    const click = vi.spyOn(prototype, 'click').mockImplementation(async function (
+      this: Locator,
+      options,
+    ) {
+      labels.push(await this.innerText());
+      return normalClick.call(this, options);
+    });
+    await spaFixture({
+      fieldMarkup:
+        '<input type="email" name="username" id="userid" placeholder="Enter only SRN without suffix of @icai.org">',
+      angularForm: true,
+      requestMarkup:
+        '<button type="button" onclick="window.generateClicked=true">Generate OTP</button><button>LOGIN</button>',
+      requestResponse:
+        '<label>OTP<input name="otp" autocomplete="one-time-code"></label><a href="/course/lecture">Open course</a><video></video><script>window.mediaPlays=0;HTMLMediaElement.prototype.play=function(){window.mediaPlays++;return Promise.resolve()}</script>',
+    });
+    const runner = new Runner();
+    await runner.start();
+    expect(labels).toEqual(['Login with OTP', 'LOGIN']);
+    expect(click).toHaveBeenCalledTimes(2);
+    for (const [options] of click.mock.calls) expect(options).toEqual({ timeout: 10_000 });
+    expect(runner.status()).toMatchObject({ state: 'OTP_REQUIRED', active: false });
+    expect(shared.log.mock.calls.map(([event]) => `${event.from}->${event.to}`).at(-1)).toBe(
+      'AUTH_REQUIRED->OTP_REQUIRED',
+    );
+    expect(await page.locator('input[name=otp]').inputValue()).toBe('');
+    expect(
+      await page.evaluate(() => (window as unknown as { mediaPlays: number }).mediaPlays),
+    ).toBe(0);
+    await runner.resume();
+    expect(labels).toEqual(['Login with OTP', 'LOGIN']);
+    expect(requests).toEqual(['/', '/request']);
+    expect(shared.write).not.toHaveBeenCalled();
+  });
+  it('waits beyond ten seconds for a legitimate verification-code OTP field after LOGIN', async () => {
+    await spaFixture({
+      fieldMarkup: '<input name="username">',
+      requestMarkup: '<button>LOGIN</button>',
+      requestResponse:
+        '<h1>LOGIN</h1><div id="step"></div><script>setTimeout(()=>document.getElementById("step").innerHTML=\'<label>Verification code<input name="verification" autocomplete="one-time-code"></label>\',11000)</script>',
+    });
+    const runner = new Runner();
+    await runner.start();
+    expect(runner.status()).toMatchObject({ state: 'OTP_REQUIRED', active: false });
+    expect(await page.locator('input[name=verification]').inputValue()).toBe('');
+    expect(requests).toEqual(['/', '/request']);
+  }, 15_000);
   it.each([
     '<button>LOGIN</button>',
     '<button> Log   In </button>',
@@ -495,18 +546,34 @@ describe('controlled ICAI browser and OTP API fixtures', () => {
       fieldMarkup: '<input type="email" name="username">',
       requestMarkup: '<button>LOGIN</button>',
       angularForm: true,
-      requestResponse: '<h1>LOGIN</h1><p>Pending</p>',
+      requestResponse:
+        '<h1>LOGIN</h1><p>Pending</p><input name="username" value="ABC1234567"><button>LOGIN</button>',
     });
     const runner = new Runner();
+    const started = Date.now();
     await runner.start();
+    expect(Date.now() - started).toBeGreaterThanOrEqual(20_000);
     expect(runner.status()).toMatchObject({
       state: 'ERROR',
       active: false,
       errorCode: 'ICAI_OTP_INPUT_NOT_FOUND',
+      icai: {
+        diagnostic: {
+          inputs: expect.arrayContaining([
+            expect.objectContaining({ name: 'username', type: 'text' }),
+          ]),
+          relevantText: expect.arrayContaining(['LOGIN']),
+          interactiveElements: expect.arrayContaining([
+            expect.objectContaining({ tagName: 'BUTTON', visibleText: 'LOGIN' }),
+          ]),
+        },
+      },
     });
+    expect(JSON.stringify([runner.status(), shared.log.mock.calls])).not.toContain('ABC1234567');
     expect(click).toHaveBeenCalledTimes(2);
+    for (const [options] of click.mock.calls) expect(options).toEqual({ timeout: 10_000 });
     expect(requests).toEqual(['/', '/request']);
-  }, 15_000);
+  }, 25_000);
   it.each(['Invalid SRN ABC1234567', 'Registration number not found', 'User not found'])(
     'returns sanitized OTP_REQUEST_FAILED on visible validation: %s',
     async (message) => {

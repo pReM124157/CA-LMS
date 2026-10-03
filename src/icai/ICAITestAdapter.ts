@@ -485,9 +485,10 @@ export class ICAITestAdapter {
       do {
         this.assertOrigin(page, 'ICAI_OTP_REQUEST_FAILED');
         if (await this.otp(page)) return 'otp_required';
-        request = await this.requestControl(page);
-        if (!request && otpModeSelected && this.targetMode === 'icai_test')
+        request = undefined;
+        if (otpModeSelected && this.targetMode === 'icai_test')
           request = await this.otpLoginSubmit(srnInput);
+        if (!request) request = await this.requestControl(page);
         if (request) break;
         await page.waitForTimeout(200);
       } while (Date.now() < requestDeadline);
@@ -498,7 +499,7 @@ export class ICAITestAdapter {
       this.assertOrigin(page, 'ICAI_OTP_REQUEST_FAILED');
       if (await this.otp(page)) return 'otp_required';
       await request.click({ timeout });
-      const deadline = Date.now() + timeout;
+      const deadline = Date.now() + 20_000;
       while (Date.now() < deadline) {
         this.assertOrigin(page, 'ICAI_OTP_REQUEST_FAILED');
         const invalidSrn = await this.visible([
