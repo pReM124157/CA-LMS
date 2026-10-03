@@ -1,6 +1,6 @@
 import pino from 'pino';
 import { env } from '../config/env.js';
-const sensitive = /password|passwd|token|cookie|authorization|secret|api[_-]?key|session/i;
+const sensitive = /password|passwd|token|cookie|authorization|secret|api[_-]?key|session|srn|otp/i;
 export const redact = (value: unknown): unknown => {
   if (Array.isArray(value)) return value.map(redact);
   if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, sensitive.test(key) ? '[REDACTED]' : redact(item)]));

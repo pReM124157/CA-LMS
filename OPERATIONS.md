@@ -27,3 +27,45 @@ otherwise the elapsed canary limit pauses the actual video and reports
 COMPLETED and ERROR remain terminal for the runner instance; restart the runner
 service for a fresh run. HLS mode disables all question submission flows and is
 for controlled compatibility testing only.
+
+### ICAI login-only compatibility canary
+
+Set `TARGET_MODE=icai_test`, `ICAI_SRN` to your authorized SRN, and optionally
+`ICAI_LOGIN_URL` (default `https://lms.icai.org/login`). The URL must use exactly
+the `https://lms.icai.org` origin without embedded credentials. This mode forces
+`AUTO_SUBMIT=false` and `REQUIRE_HUMAN_CONFIRMATION=true` regardless of configured
+values. It uses the existing browser backend, including Browserless CDP.
+
+Start opens the configured login page and uses the site's normal SRN/OTP controls.
+It stops at `OTP_REQUIRED` with no polling timer. Submit the human-received OTP
+through authenticated `POST /api/icai/otp` with JSON `{"otp":"123456"}`. The OTP
+must be a string of 4–8 digits. Avoid putting real OTPs in shell command history.
+The endpoint uses existing dashboard Basic Auth and returns `Cache-Control:
+no-store`. It removes the OTP from the parsed request body and retains no runner
+OTP field or database record. The adapter clears any remaining visible OTP input
+after the operation. A lost browser session fails instead of opening a new session.
+
+Selectors prefer accessible textbox names, labels, and placeholders, then
+SRN/OTP name/id attributes and `autocomplete=one-time-code`. Controls use button
+and link roles with normal Login with OTP, Send/Request OTP, Verify, Login, and
+Submit names. Authentication requires dashboard heading/navigation evidence,
+a visible Logout/Sign out control, and disappearance of the OTP input, all on
+the ICAI origin. URL changes alone do not prove login.
+
+Success transitions `OTP_REQUIRED → DASHBOARD → PAUSED` and stops. Start/Resume
+will not resend OTP or advance the authenticated session. Inspect the dashboard
+manually. No course, lecture, video, question, webcam, attendance, or completion
+controls are automated. Security challenges are left intact; unsupported layouts
+or an unconfirmed login fail after bounded waits. Restart the service for a new
+attempt after a terminal error.
+
+Status exposes only `icai.stage`, `srnConfigured`, `loginOrigin`, structured error
+codes, and (only when controls are missing) bounded diagnostic metadata. Diagnostics
+contain input type/name/id/placeholder/associated labels and visible control text,
+with configured SRN/OTP and recognizable numeric secrets redacted. They never read
+input values, cookies, headers, or browser storage. Raw Playwright errors are not
+returned or logged. SRN/OTP fields are also covered by logger redaction.
+
+The automated ICAI tests use intercepted browser fixtures and send no live OTP
+requests. Real ICAI layout and live authentication require a separate authorized
+operator canary; they are not established by the fixture tests.

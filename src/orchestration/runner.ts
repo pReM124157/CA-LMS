@@ -9,6 +9,13 @@ import { RunnerStateMachine, type RunnerState } from './runnerStateMachine.js';
 import type { Question, Recommendation } from '../questions/types.js';
 import { YouTubeTestAdapter, type YouTubeTestState } from '../video/YouTubeTestAdapter.js';
 import { HLSTestAdapter, type HLSState, type HLSErrorCode } from '../video/HLSTestAdapter.js';
+import {
+  ICAITestAdapter,
+  ICAILoginError,
+  ICAI_ORIGIN,
+  validOtp,
+  type LoginDiagnostics,
+} from '../icai/ICAITestAdapter.js';
 import { isTerminalYouTubeError } from '../video/youtubeErrors.js';
 
 export class RunnerOperationError extends Error {
@@ -17,7 +24,11 @@ export class RunnerOperationError extends Error {
       | 'NO_PENDING_QUESTION'
       | 'QUESTION_NO_LONGER_PRESENT'
       | 'BROWSER_SESSION_EXPIRED'
-      | 'QUESTION_FLOW_DISABLED',
+      | 'QUESTION_FLOW_DISABLED'
+      | 'ICAI_MODE_REQUIRED'
+      | 'ICAI_OTP_STATE_REQUIRED'
+      | 'ICAI_OTP_FORMAT_INVALID'
+      | 'ICAI_OTP_SUBMISSION_IN_PROGRESS',
     public readonly recoverable: boolean,
   ) {
     super(code);
@@ -42,10 +53,19 @@ export class Runner {
   private readonly adapter = new GenericLMSAdapter();
   private readonly youtubeAdapter = new YouTubeTestAdapter();
   private readonly hlsAdapter = new HLSTestAdapter();
+  private readonly icaiAdapter = new ICAITestAdapter();
+  private icai?: {
+    stage: 'login' | 'otp_required' | 'authenticated' | 'error';
+    srnConfigured: boolean;
+    loginOrigin: string;
+    diagnostic?: LoginDiagnostics;
+  };
+  private otpSubmitting = false;
+  private icaiPage?: Page;
   private readonly machine = new RunnerStateMachine();
   private readonly solver: AIProvider;
   private readonly policy = new AutoSubmitPolicy(
-    env.AUTO_SUBMIT,
+    env.TARGET_MODE === 'icai_test' ? false : env.AUTO_SUBMIT,
     env.AUTOSUBMIT_ALLOWED_HOSTS.split(','),
   );
   private active = false;
@@ -86,6 +106,7 @@ export class Runner {
     video: VideoStatus | undefined;
     youtube: YouTubeStatus | undefined;
     hls: Runner['hls'];
+    icai: Runner['icai'];
     errorCode: string | undefined;
     heartbeatAt: number | undefined;
   } {
@@ -104,6 +125,7 @@ export class Runner {
       video: this.video,
       youtube: this.youtube,
       hls: this.hls,
+      icai: this.icai,
       errorCode: this.errorCode,
       heartbeatAt: this.heartbeatAt,
     };
@@ -137,7 +159,13 @@ export class Runner {
     this.move('ERROR', code);
   }
   async start(): Promise<void> {
-    if (this.active || this.machine.state === 'COMPLETED' || this.machine.state === 'ERROR') return;
+    if (
+      this.active ||
+      this.machine.state === 'COMPLETED' ||
+      this.machine.state === 'ERROR' ||
+      (env.TARGET_MODE === 'icai_test' && this.icai)
+    )
+      return;
     this.pending = undefined;
     this.active = true;
     this.heartbeatAt = Date.now();
@@ -145,6 +173,22 @@ export class Runner {
     try {
       this.validateTarget();
       const page = await this.browser.page();
+      if (env.TARGET_MODE === 'icai_test') {
+        this.icai = {
+          stage: 'login',
+          srnConfigured: Boolean(env.ICAI_SRN),
+          loginOrigin: ICAI_ORIGIN,
+        };
+        this.icaiPage = page;
+        this.move('AUTH_REQUIRED', 'ICAI login requires human OTP');
+        await this.icaiAdapter.requestOtp(page, env.ICAI_LOGIN_URL, env.ICAI_SRN!);
+        if (!this.active) return;
+        this.currentUrl = ICAI_ORIGIN;
+        this.icai.stage = 'otp_required';
+        this.halt();
+        this.move('OTP_REQUIRED', 'normal OTP input detected; waiting for operator');
+        return;
+      }
       if (env.TARGET_MODE === 'hls_test') {
         await page.goto(`${env.LMS_BASE_URL}/hls-test`, { waitUntil: 'domcontentloaded' });
         this.currentUrl = new URL('/hls-test', env.LMS_BASE_URL).origin + '/hls-test';
@@ -189,6 +233,10 @@ export class Runner {
       if (this.active)
         this.timer = setInterval(() => void this.tick(), env.QUESTION_POLL_INTERVAL_MS);
     } catch (error) {
+      if (env.TARGET_MODE === 'icai_test') {
+        this.icaiFailure(error);
+        return;
+      }
       this.halt();
       if (env.TARGET_MODE === 'hls_test')
         this.errorCode = env.HLS_TEST_URL ? 'HLS_MEDIA_ERROR' : 'HLS_TEST_URL_REQUIRED';
@@ -203,9 +251,50 @@ export class Runner {
       if (env.TARGET_MODE !== 'hls_test') throw error;
     }
   }
+  private icaiFailure(error: unknown): void {
+    if (this.machine.state === 'ERROR' || this.machine.state === 'COMPLETED') return;
+    const failure =
+      error instanceof ICAILoginError ? error : new ICAILoginError('ICAI_LOGIN_PAGE_UNAVAILABLE');
+    this.halt();
+    this.errorCode = failure.code;
+    if (this.icai) {
+      this.icai.stage = 'error';
+      this.icai.diagnostic = failure.diagnostic;
+    }
+    this.move('ERROR', failure.code);
+  }
+  async submitIcaiOtp(otp: string): Promise<void> {
+    if (env.TARGET_MODE !== 'icai_test')
+      throw new RunnerOperationError('ICAI_MODE_REQUIRED', false);
+    if (!validOtp(otp)) throw new RunnerOperationError('ICAI_OTP_FORMAT_INVALID', false);
+    if (this.machine.state !== 'OTP_REQUIRED')
+      throw new RunnerOperationError('ICAI_OTP_STATE_REQUIRED', false);
+    if (this.otpSubmitting)
+      throw new RunnerOperationError('ICAI_OTP_SUBMISSION_IN_PROGRESS', false);
+    this.otpSubmitting = true;
+    try {
+      const page = this.icaiPage;
+      if (!this.browser.connected() || !page || page.isClosed())
+        throw new ICAILoginError('ICAI_LOGIN_NOT_CONFIRMED');
+      await this.icaiAdapter.submitOtp(page, otp, env.ICAI_SRN!);
+      if (this.machine.state !== 'OTP_REQUIRED') return;
+      this.currentUrl = ICAI_ORIGIN;
+      this.icai!.stage = 'authenticated';
+      this.move('DASHBOARD', 'ICAI authenticated dashboard confirmed');
+      this.halt();
+      this.move('PAUSED', 'ICAI login canary finished; manual dashboard inspection');
+    } catch (error) {
+      this.icaiFailure(
+        error instanceof ICAILoginError ? error : new ICAILoginError('ICAI_LOGIN_NOT_CONFIRMED'),
+      );
+    } finally {
+      this.otpSubmitting = false;
+    }
+  }
   async pause(): Promise<void> {
     if (this.machine.state === 'COMPLETED' || this.machine.state === 'ERROR') return;
     this.halt();
+    if (env.TARGET_MODE === 'icai_test') return;
     if (env.TARGET_MODE === 'hls_test' && this.browser.connected()) {
       await this.hlsAdapter.pause(await this.browser.page());
       if (this.hls)
@@ -229,6 +318,11 @@ export class Runner {
     this.move('ERROR', reason);
   }
   private validateTarget(): void {
+    if (env.TARGET_MODE === 'icai_test') {
+      if (!env.ICAI_SRN || new URL(env.ICAI_LOGIN_URL).origin !== ICAI_ORIGIN)
+        throw new ICAILoginError('ICAI_LOGIN_PAGE_UNAVAILABLE');
+      return;
+    }
     if (env.TARGET_MODE === 'hls_test') {
       if (!env.HLS_TEST_URL) throw new Error('HLS_TEST_URL_REQUIRED');
       return;
@@ -245,7 +339,7 @@ export class Runner {
         throw new Error('TARGET_OUTSIDE_LMS_ORIGIN');
   }
   private async tick(): Promise<void> {
-    if (!this.active || this.pending || this.ticking) return;
+    if (env.TARGET_MODE === 'icai_test' || !this.active || this.pending || this.ticking) return;
     this.ticking = true;
     this.heartbeatAt = Date.now();
     try {
@@ -434,7 +528,11 @@ export class Runner {
       .catch(() => undefined);
   }
   async confirm(optionId: string): Promise<void> {
-    if (env.TARGET_MODE === 'youtube_test' || env.TARGET_MODE === 'hls_test')
+    if (
+      env.TARGET_MODE === 'youtube_test' ||
+      env.TARGET_MODE === 'hls_test' ||
+      env.TARGET_MODE === 'icai_test'
+    )
       throw new RunnerOperationError('QUESTION_FLOW_DISABLED', false);
     const pending = this.pending;
     if (!pending) throw new RunnerOperationError('NO_PENDING_QUESTION', false);

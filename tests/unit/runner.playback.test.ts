@@ -146,6 +146,9 @@ describe('terminal polling and controlled HLS runner', () => {
       expect.anything(),
     );
     await expect(runner.confirm('b')).rejects.toMatchObject({ code: 'QUESTION_FLOW_DISABLED' });
+    await expect(runner.submitIcaiOtp('123456')).rejects.toMatchObject({
+      code: 'ICAI_MODE_REQUIRED',
+    });
   });
   it('does not overlap slow polls or overwrite completion after polling stops', async () => {
     const runner = new Runner();
