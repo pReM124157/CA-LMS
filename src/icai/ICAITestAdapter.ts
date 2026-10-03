@@ -1,4 +1,5 @@
 import type { Locator, Page, Route } from 'playwright';
+import { env } from '../config/env.js';
 
 export const ICAI_ORIGIN = 'https://lms.icai.org';
 export type ICAIErrorCode =
@@ -45,7 +46,10 @@ export const validOtp = (otp: unknown): otp is string =>
 const timeout = 10_000;
 
 export class ICAITestAdapter {
-  constructor(private readonly spaReadyTimeoutMs = 15_000) {}
+  constructor(
+    private readonly spaReadyTimeoutMs = 15_000,
+    private readonly targetMode = env.TARGET_MODE,
+  ) {}
   private entryStatus?: number;
   private guarded?: Page;
   private escaped = false;
@@ -167,7 +171,37 @@ export class ICAITestAdapter {
   private requestControl(page: Page): Promise<Locator | undefined> {
     return this.exactOtpControl(page, /^\s*(?:generate|send|request|get)\s+otp\s*$/i);
   }
-  private async exactOtpControl(page: Page, label: RegExp): Promise<Locator | undefined> {
+  private async otpLoginSubmit(srnInput: Locator): Promise<Locator | undefined> {
+    // Restrict generic login labels to the identified SRN form, never page-wide.
+    const form = srnInput.locator('xpath=ancestor::*[self::form or @role="form"][1]');
+    if (!(await form.count()) || !(await form.isVisible())) return undefined;
+    // Even a hidden password field makes this unsuitable for the OTP fallback.
+    if (await form.locator('input[type="password"]').count()) return undefined;
+    const label = /^\s*(?:login|log\s+in|sign\s+in)\s*$/i;
+    const button = await this.visible([form.locator('button').filter({ hasText: label })]);
+    if (button) return button;
+    const submits = form.locator('input[type="submit"]');
+    for (let index = 0; index < Math.min(await submits.count(), 30); index++) {
+      const submit = submits.nth(index);
+      // Value is read solely to select this explicit submit control; never returned/logged.
+      if (
+        (await submit.isVisible()) &&
+        (await submit.evaluate(
+          (element, source) =>
+            new RegExp(source, 'i').test(
+              (element as HTMLInputElement).value.replace(/\s+/g, ' ').trim(),
+            ),
+          label.source,
+        ))
+      )
+        return submit;
+    }
+    const roleButton = await this.visible([
+      form.locator('[role="button"]').and(form.getByRole('button', { name: label })),
+    ]);
+    return roleButton ?? this.exactOtpControl(form, label);
+  }
+  private async exactOtpControl(page: Page | Locator, label: RegExp): Promise<Locator | undefined> {
     // These allowlisted labels alone authorize the custom-element fallback.
     // Prefer semantic controls across all candidates before returning exact text.
     const matches = page.getByText(label);
@@ -419,6 +453,7 @@ export class ICAITestAdapter {
     try {
       let srnInput: Locator | undefined;
       let switchControl: Locator | undefined;
+      let otpModeSelected = false;
       const controlsDeadline = Date.now() + this.spaReadyTimeoutMs;
       do {
         this.assertOrigin(page, 'ICAI_OTP_REQUEST_FAILED');
@@ -430,6 +465,7 @@ export class ICAITestAdapter {
       } while (Date.now() < controlsDeadline);
       if (switchControl) {
         await switchControl.click({ timeout });
+        otpModeSelected = true;
         this.assertOrigin(page, 'ICAI_OTP_REQUEST_FAILED');
         const deadline = Date.now() + timeout;
         do {
@@ -450,6 +486,8 @@ export class ICAITestAdapter {
         this.assertOrigin(page, 'ICAI_OTP_REQUEST_FAILED');
         if (await this.otp(page)) return 'otp_required';
         request = await this.requestControl(page);
+        if (!request && otpModeSelected && this.targetMode === 'icai_test')
+          request = await this.otpLoginSubmit(srnInput);
         if (request) break;
         await page.waitForTimeout(200);
       } while (Date.now() < requestDeadline);
@@ -458,10 +496,17 @@ export class ICAITestAdapter {
         return this.missing(page, 'ICAI_OTP_UI_NOT_FOUND', [srn]);
       }
       this.assertOrigin(page, 'ICAI_OTP_REQUEST_FAILED');
+      if (await this.otp(page)) return 'otp_required';
       await request.click({ timeout });
       const deadline = Date.now() + timeout;
       while (Date.now() < deadline) {
         this.assertOrigin(page, 'ICAI_OTP_REQUEST_FAILED');
+        const invalidSrn = await this.visible([
+          page.getByText(
+            /(?:invalid|incorrect)\s+(?:srn|(?:student\s+)?registration(?:\s+(?:number|no))?)|(?:srn|registration\s+(?:number|no)|user)\s+(?:is\s+)?(?:not found|invalid)/i,
+          ),
+        ]);
+        if (invalidSrn) return this.missing(page, 'ICAI_OTP_REQUEST_FAILED', [srn]);
         if (await this.otp(page)) return 'otp_required';
         await page.waitForTimeout(200);
       }

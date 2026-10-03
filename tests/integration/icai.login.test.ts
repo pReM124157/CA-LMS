@@ -89,10 +89,13 @@ const spaFixture = async (
     requestMarkup?: string;
     fieldMarkup?: string;
     onRequest?: (body: string) => void;
+    requestResponse?: string;
+    angularForm?: boolean;
   } = {},
 ): Promise<void> => {
   const form =
-    '<form id="srn-form" action="/request" method="post" hidden>' +
+    // Angular forms validate SRN themselves despite using type=email for this field.
+    `<form id="srn-form" action="/request" method="post" hidden ${options.angularForm ? 'novalidate' : ''}>` +
     (options.fieldMarkup ?? '<label>SRN<input name="srn"></label>') +
     (options.requestMarkup ?? '<button>Generate OTP</button>') +
     '</form>';
@@ -113,7 +116,9 @@ const spaFixture = async (
       return route.fulfill({
         status: 200,
         contentType: 'text/html',
-        body: '<label>OTP<input name="otp"></label><button>Verify OTP</button>',
+        body:
+          options.requestResponse ??
+          '<label>OTP<input name="otp"></label><button>Verify OTP</button>',
       });
     }
     const root = url.pathname === '/';
@@ -393,6 +398,138 @@ describe('controlled ICAI browser and OTP API fixtures', () => {
       /ABC1234567|654321|private-|hidden-value|diagnostic-secret|defaultValue|"value"/,
     );
   });
+  it.each([
+    '<button>LOGIN</button>',
+    '<button> Log   In </button>',
+    '<input type="submit" value="SIGN IN">',
+    '<div role="button" aria-label="LOGIN" onclick="document.getElementById(\'srn-form\').requestSubmit()">Continue</div>',
+    '<otp-submit onclick="document.getElementById(\'srn-form\').requestSubmit()"><span>Sign In</span></otp-submit>',
+  ])(
+    'submits the real SRN email form once with exact control %s and stops at OTP_REQUIRED',
+    async (requestMarkup) => {
+      const click = vi.spyOn(Object.getPrototypeOf(page.locator('body')), 'click');
+      const requested = vi.fn();
+      await spaFixture({
+        fieldMarkup:
+          '<input type="email" name="username" id="userid" placeholder="Enter only SRN without suffix of @icai.org">',
+        angularForm: true,
+        requestMarkup,
+        onRequest: requested,
+      });
+      const runner = new Runner();
+      await runner.start();
+      expect(runner.status()).toMatchObject({ state: 'OTP_REQUIRED', active: false });
+      expect(shared.log.mock.calls.map(([event]) => `${event.from}->${event.to}`).at(-1)).toBe(
+        'AUTH_REQUIRED->OTP_REQUIRED',
+      );
+      expect(requested).toHaveBeenCalledOnce();
+      expect(new URLSearchParams(requested.mock.calls[0]![0]).get('username')).toBe('ABC1234567');
+      expect(click).toHaveBeenCalledTimes(2);
+      for (const [options] of click.mock.calls) expect(options).toEqual({ timeout: 10_000 });
+      expect(await page.locator('input[name=otp]').inputValue()).toBe('');
+      await runner.resume();
+      expect(click).toHaveBeenCalledTimes(2);
+      expect(requests).toEqual(['/', '/request']);
+      expect(shared.write).not.toHaveBeenCalled();
+      expect(JSON.stringify([runner.status(), shared.log.mock.calls])).not.toContain('ABC1234567');
+    },
+  );
+  it.each([
+    {
+      name: 'OTP mode not selected',
+      pageMarkup:
+        '<h1>ICAI Digital Learning Campus</h1><form><input name="username"><button onclick="window.loginClicks=1">LOGIN</button></form>',
+      clicks: 0,
+    },
+    {
+      name: 'LOGIN outside the SRN form',
+      fieldMarkup: '<input name="username">',
+      requestMarkup: '',
+      controlMarkup:
+        '<button onclick="document.getElementById(\'srn-form\').hidden=false;this.hidden=true">Login with OTP</button><button onclick="window.loginClicks=1">LOGIN</button>',
+      clicks: 1,
+    },
+    {
+      name: 'password form',
+      fieldMarkup: '<input name="username"><input type="password">',
+      requestMarkup: '<button onclick="window.loginClicks=1">LOGIN</button>',
+      clicks: 1,
+    },
+    {
+      name: 'partial login label',
+      fieldMarkup: '<input name="username">',
+      requestMarkup: '<button onclick="window.loginClicks=1">LOGIN to your account</button>',
+      clicks: 1,
+    },
+  ])(
+    'rejects LOGIN as an OTP request in $name',
+    async (options) => {
+      const click = vi.spyOn(Object.getPrototypeOf(page.locator('body')), 'click');
+      await spaFixture(options);
+      await expect(
+        new ICAITestAdapter(300).requestOtp(page, 'https://lms.icai.org/login', 'ABC1234567'),
+      ).rejects.toMatchObject({ code: 'ICAI_OTP_UI_NOT_FOUND' });
+      expect(click).toHaveBeenCalledTimes(options.clicks);
+      expect(
+        await page.evaluate(() => (window as unknown as { loginClicks?: number }).loginClicks),
+      ).toBeUndefined();
+      expect(requests).toEqual(['/login']);
+    },
+    15_000,
+  );
+  it('rejects LOGIN fallback outside icai_test mode', async () => {
+    const click = vi.spyOn(Object.getPrototypeOf(page.locator('body')), 'click');
+    await spaFixture({
+      fieldMarkup: '<input name="username">',
+      requestMarkup: '<button>LOGIN</button>',
+    });
+    await expect(
+      new ICAITestAdapter(300, 'fake').requestOtp(page, 'https://lms.icai.org/login', 'ABC1234567'),
+    ).rejects.toMatchObject({ code: 'ICAI_OTP_UI_NOT_FOUND' });
+    expect(click).toHaveBeenCalledExactlyOnceWith({ timeout: 10_000 });
+    expect(requests).toEqual(['/login']);
+  }, 15_000);
+  it('returns OTP_INPUT_NOT_FOUND after a single LOGIN submit that produces no OTP', async () => {
+    const click = vi.spyOn(Object.getPrototypeOf(page.locator('body')), 'click');
+    await spaFixture({
+      fieldMarkup: '<input type="email" name="username">',
+      requestMarkup: '<button>LOGIN</button>',
+      angularForm: true,
+      requestResponse: '<h1>LOGIN</h1><p>Pending</p>',
+    });
+    const runner = new Runner();
+    await runner.start();
+    expect(runner.status()).toMatchObject({
+      state: 'ERROR',
+      active: false,
+      errorCode: 'ICAI_OTP_INPUT_NOT_FOUND',
+    });
+    expect(click).toHaveBeenCalledTimes(2);
+    expect(requests).toEqual(['/', '/request']);
+  }, 15_000);
+  it.each(['Invalid SRN ABC1234567', 'Registration number not found', 'User not found'])(
+    'returns sanitized OTP_REQUEST_FAILED on visible validation: %s',
+    async (message) => {
+      const click = vi.spyOn(Object.getPrototypeOf(page.locator('body')), 'click');
+      await spaFixture({
+        fieldMarkup: '<input type="email" name="username">',
+        requestMarkup: '<button>LOGIN</button>',
+        angularForm: true,
+        requestResponse: `<h1>LOGIN</h1><p role="alert">${message}</p><input name="username" value="ABC1234567">`,
+      });
+      const runner = new Runner();
+      await runner.start();
+      expect(runner.status()).toMatchObject({
+        state: 'ERROR',
+        active: false,
+        errorCode: 'ICAI_OTP_REQUEST_FAILED',
+        icai: { diagnostic: { finalPathname: '/request', httpStatus: 200 } },
+      });
+      expect(JSON.stringify([runner.status(), shared.log.mock.calls])).not.toContain('ABC1234567');
+      expect(click).toHaveBeenCalledTimes(2);
+      expect(requests).toEqual(['/', '/request']);
+    },
+  );
   it('restored authentication goes AUTH_REQUIRED → DASHBOARD → PAUSED without course or video activity', async () => {
     await spaFixture({
       pageMarkup:
