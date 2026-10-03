@@ -61,8 +61,8 @@ attempt after a terminal error.
 
 Status exposes only `icai.stage`, `srnConfigured`, `loginOrigin`, structured error
 codes, and bounded diagnostic metadata for entry or missing-control failures. Diagnostics
-contain sanitized final pathname, available HTTP status, input name/id/placeholder,
-and visible button/link text,
+contain sanitized final pathname, available HTTP status, page title, up to 40 relevant
+visible text snippets, and up to 40 visible interactive-element metadata records,
 with configured SRN/OTP and recognizable numeric secrets redacted. They never read
 input values, cookies, headers, or browser storage. Raw Playwright errors are not
 returned or logged. SRN/OTP fields are also covered by logger redaction.
@@ -82,5 +82,28 @@ normal Generate/Send/Request OTP control.
 Entry failures distinguish `ICAI_LOGIN_HTTP_ERROR` from
 `ICAI_LOGIN_APP_NOT_RENDERED`; missing controls and request failures retain their
 separate OTP codes. Diagnostics expose only sanitized final pathname, available
-HTTP status, visible button/link text, and input id/name/placeholder. Query strings,
-input values, input types, and associated labels are omitted.
+HTTP status and bounded login-related DOM metadata. Query strings and form values
+are omitted.
+
+
+ICAI OTP login choices can also be rendered as Angular div/span controls. The
+adapter accepts only normalized Login with OTP, Log in with OTP, Sign in with
+OTP, or Sign-in with OTP labels. It follows at most four ancestor levels to a
+button, link, matching role, or tabindex=0 parent; the parent must retain the
+same exact label. SSP choices and unrelated OTP help text are never clicked.
+
+Before requesting OTP, a restored session may be recognized by at least two
+distinct visible authenticated indicators: Self-Paced Online Module, My Learning
+History, Dashboard, My Courses, Logout/Sign out, or paired Set A/Set B cards.
+Repeated copies of one label count once; Set A/Set B together count as one signal.
+Search fields and Previous/Next controls never establish authentication. A
+restored session goes directly from AUTH_REQUIRED to DASHBOARD to PAUSED, with
+no OTP request, polling timer, course navigation, or media playback.
+
+Missing-control diagnostics contain final pathname, available HTTP status,
+page title, up to 40 relevant visible text snippets, and up to 40 metadata records
+for visible button/a/role/tabindex/onclick elements. Metadata includes tagName,
+role, ariaLabel, title, and visibleText. Strings are capped at 160 characters;
+form-field values, editable content, hidden text, URL query strings, and configured
+secrets (including Browserless credentials) are excluded or redacted. No cookies,
+headers, or browser storage are read.
