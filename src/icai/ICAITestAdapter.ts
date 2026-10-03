@@ -481,6 +481,7 @@ export class ICAITestAdapter {
       }
       await srnInput.fill(srn, { timeout });
       let request: Locator | undefined;
+      let loginSubmitSelected = false;
       const requestDeadline = Date.now() + timeout;
       do {
         this.assertOrigin(page, 'ICAI_OTP_REQUEST_FAILED');
@@ -488,6 +489,7 @@ export class ICAITestAdapter {
         request = undefined;
         if (otpModeSelected && this.targetMode === 'icai_test')
           request = await this.otpLoginSubmit(srnInput);
+        loginSubmitSelected = Boolean(request);
         if (!request) request = await this.requestControl(page);
         if (request) break;
         await page.waitForTimeout(200);
@@ -499,23 +501,43 @@ export class ICAITestAdapter {
       this.assertOrigin(page, 'ICAI_OTP_REQUEST_FAILED');
       if (await this.otp(page)) return 'otp_required';
       await request.click({ timeout });
-      const deadline = Date.now() + 20_000;
-      while (Date.now() < deadline) {
-        this.assertOrigin(page, 'ICAI_OTP_REQUEST_FAILED');
-        const invalidSrn = await this.visible([
-          page.getByText(
-            /(?:invalid|incorrect)\s+(?:srn|(?:student\s+)?registration(?:\s+(?:number|no))?)|(?:srn|registration\s+(?:number|no)|user)\s+(?:is\s+)?(?:not found|invalid)/i,
-          ),
-        ]);
-        if (invalidSrn) return this.missing(page, 'ICAI_OTP_REQUEST_FAILED', [srn]);
-        if (await this.otp(page)) return 'otp_required';
-        await page.waitForTimeout(200);
-      }
-      return this.missing(page, 'ICAI_OTP_INPUT_NOT_FOUND', [srn]);
+      return await this.waitForRequestedOtp(page, srn, loginSubmitSelected);
     } catch (error) {
       if (error instanceof ICAILoginError) throw error;
       throw new ICAILoginError('ICAI_OTP_REQUEST_FAILED');
     }
+  }
+  private async waitForRequestedOtp(
+    page: Page,
+    srn: string,
+    afterLogin: boolean,
+  ): Promise<'otp_required'> {
+    let secondRequestAllowed = afterLogin;
+    let deadline = Date.now() + 20_000;
+    while (Date.now() < deadline) {
+      this.assertOrigin(page, 'ICAI_OTP_REQUEST_FAILED');
+      const invalidSrn = await this.visible([
+        page.getByText(
+          /(?:invalid|incorrect)\s+(?:srn|(?:student\s+)?registration(?:\s+(?:number|no))?)|(?:srn|registration\s+(?:number|no)|user)\s+(?:is\s+)?(?:not found|invalid)/i,
+        ),
+      ]);
+      if (invalidSrn) return this.missing(page, 'ICAI_OTP_REQUEST_FAILED', [srn]);
+      if (await this.otp(page)) return 'otp_required';
+      if (secondRequestAllowed) {
+        const generate = await this.requestControl(page);
+        if (generate) {
+          this.assertOrigin(page, 'ICAI_OTP_REQUEST_FAILED');
+          if (await this.otp(page)) return 'otp_required';
+          // Only one second-stage request is allowed. LOGIN is never searched here.
+          secondRequestAllowed = false;
+          await generate.click({ timeout });
+          deadline = Date.now() + 20_000;
+          continue;
+        }
+      }
+      await page.waitForTimeout(200);
+    }
+    return this.missing(page, 'ICAI_OTP_INPUT_NOT_FOUND', [srn]);
   }
   async submitOtp(page: Page, otp: string, srn: string): Promise<void> {
     let input: Locator | undefined;
