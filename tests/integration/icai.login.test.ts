@@ -1,6 +1,6 @@
 import type { Server } from 'node:http';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
-import { chromium, type Browser, type BrowserContext, type Page } from 'playwright';
+import { chromium, type Browser, type BrowserContext, type Locator, type Page } from 'playwright';
 const shared = vi.hoisted(() => ({
   page: undefined as Page | undefined,
   log: vi.fn(),
@@ -14,8 +14,8 @@ vi.mock('../../src/config/env.js', async () => {
     env: actual.parseEnv({
       TARGET_MODE: 'icai_test',
       ICAI_SRN: 'ABC1234567',
-      AUTO_SUBMIT: 'true',
-      REQUIRE_HUMAN_CONFIRMATION: 'false',
+      AUTO_SUBMIT: 'false',
+      REQUIRE_HUMAN_CONFIRMATION: 'true',
     }),
   };
 });
@@ -86,10 +86,13 @@ const spaFixture = async (
     escape?: boolean;
     controlMarkup?: string;
     pageMarkup?: string;
+    requestMarkup?: string;
   } = {},
 ): Promise<void> => {
   const form =
-    '<form id="srn-form" action="/request" method="post" hidden><label>SRN<input name="srn"></label><button>Generate OTP</button></form>';
+    '<form id="srn-form" action="/request" method="post" hidden><label>SRN<input name="srn"></label>' +
+    (options.requestMarkup ?? '<button>Generate OTP</button>') +
+    '</form>';
   const button =
     options.controlMarkup ??
     '<button onclick="document.getElementById(\'srn-form\').hidden=false;this.hidden=true">Login with OTP</button>';
@@ -138,6 +141,7 @@ describe('controlled ICAI browser and OTP API fixtures', () => {
   });
   afterEach(async () => {
     await context.close();
+    vi.restoreAllMocks();
   });
   it.each([
     '<button onclick="document.getElementById(\'srn-form\').hidden=false;this.hidden=true">Login with OTP</button>',
@@ -145,6 +149,9 @@ describe('controlled ICAI browser and OTP API fixtures', () => {
     '<div tabindex="0" onclick="document.getElementById(\'srn-form\').hidden=false;this.hidden=true"><span><span> Login   with OTP </span></span></div>',
     '<div role="link" onclick="document.getElementById(\'srn-form\').hidden=false;this.hidden=true"> Sign-in with OTP </div>',
     '<button onclick="document.getElementById(\'srn-form\').hidden=false;this.hidden=true"> LOG   IN with otp </button>',
+    '<div onclick="document.getElementById(\'srn-form\').hidden=false;this.hidden=true">Login with OTP</div>',
+    '<span onclick="document.getElementById(\'srn-form\').hidden=false;this.hidden=true">Login with OTP</span>',
+    '<otp-login onclick="document.getElementById(\'srn-form\').hidden=false;this.hidden=true"><div><span> Login with OTP </span></div></otp-login>',
     '<a onclick="document.getElementById(\'srn-form\').hidden=false;this.hidden=true"><span>sign in with otp</span></a>',
     '<div role="link" onclick="document.getElementById(\'srn-form\').hidden=false;this.hidden=true">LOG   IN   with   otp</div>',
   ])('discovers only exact OTP login labels in custom controls: %s', async (controlMarkup) => {
@@ -157,10 +164,11 @@ describe('controlled ICAI browser and OTP API fixtures', () => {
   it.each([
     '<button onclick="window.clicked=true">Learn about OTP</button>',
     '<div role="button" onclick="window.clicked=true">Sign in with SSP</div>',
-    '<div role="button" onclick="window.clicked=true"><span>Login with OTP</span><span>Open course</span></div>',
-    '<div onclick="window.clicked=true">Login with OTP</div>',
+    '<div role="button" onclick="window.clicked=true">Login with OTP Open course</div>',
+    '<span onclick="window.clicked=true">Click here for OTP help</span>',
+    '<div onclick="window.clicked=true">Login</div>',
     '<button hidden onclick="window.clicked=true">Login with OTP</button>',
-  ])('never clicks unrelated, hidden or non-actionable OTP/SSP text: %s', async (markup) => {
+  ])('never clicks unrelated, generic or hidden OTP/SSP text: %s', async (markup) => {
     await spaFixture({ pageMarkup: '<h1>ICAI Digital Learning Campus</h1>' + markup });
     await expect(
       new ICAITestAdapter(300).requestOtp(page, 'https://lms.icai.org/login', 'ABC1234567'),
@@ -170,6 +178,63 @@ describe('controlled ICAI browser and OTP API fixtures', () => {
     ).toBeUndefined();
     expect(requests).toEqual(['/login']);
   });
+  it.each(['Generate OTP', 'Send OTP', 'Request OTP', 'Get OTP'])(
+    'requests %s through exact custom text only after SRN appears, then stops at OTP_REQUIRED',
+    async (label) => {
+      const click = vi.spyOn(Object.getPrototypeOf(page.locator('body')), 'click');
+      await spaFixture({
+        controlMarkup:
+          '<div onclick="window.loginClicks=(window.loginClicks||0)+1;document.getElementById(\'srn-form\').hidden=false;this.hidden=true"><span>Login with OTP</span></div>',
+        requestMarkup: `<otp-request onclick="if(!document.querySelector('input[name=srn]').value)throw new Error('SRN required');document.getElementById('srn-form').requestSubmit()"><span>${label}</span></otp-request>`,
+      });
+      const runner = new Runner();
+      await runner.start();
+      expect(runner.status()).toMatchObject({
+        state: 'OTP_REQUIRED',
+        active: false,
+        icai: { stage: 'otp_required' },
+      });
+      expect(click).toHaveBeenCalledTimes(2);
+      for (const [options] of click.mock.calls) expect(options).toEqual({ timeout: 10_000 });
+      await runner.resume();
+      expect(click).toHaveBeenCalledTimes(2);
+      expect(requests).toEqual(['/', '/request']);
+      expect(shared.write).not.toHaveBeenCalled();
+    },
+  );
+  it('prefers the semantic ancestor to its exact nested span', async () => {
+    const prototype = Object.getPrototypeOf(page.locator('body'));
+    const normalClick = prototype.click;
+    const clickedTags: string[] = [];
+    vi.spyOn(prototype, 'click').mockImplementation(async function (this: Locator, options) {
+      clickedTags.push(await this.evaluate((element) => element.tagName));
+      return normalClick.call(this, options);
+    });
+    await spaFixture({
+      controlMarkup:
+        '<button onclick="document.getElementById(\'srn-form\').hidden=false"><span>Login with OTP</span></button>',
+    });
+    await new ICAITestAdapter(500).requestOtp(page, 'https://lms.icai.org/login', 'ABC1234567');
+    expect(clickedTags).toEqual(['BUTTON', 'BUTTON']);
+  });
+  it('clicks the exact login choice once and never clicks Generate OTP without a visible SRN', async () => {
+    const click = vi.spyOn(Object.getPrototypeOf(page.locator('body')), 'click');
+    await spaFixture({
+      pageMarkup:
+        '<h1>ICAI Digital Learning Campus</h1><div onclick="window.loginClicks=(window.loginClicks||0)+1">Login with OTP</div><div onclick="window.requestClicks=(window.requestClicks||0)+1">Generate OTP</div><input name="srn" hidden>',
+    });
+    await expect(
+      new ICAITestAdapter(300).requestOtp(page, 'https://lms.icai.org/login', 'ABC1234567'),
+    ).rejects.toMatchObject({ code: 'ICAI_OTP_UI_NOT_FOUND' });
+    expect(click).toHaveBeenCalledExactlyOnceWith({ timeout: 10_000 });
+    expect(
+      await page.evaluate(() => ({
+        login: (window as unknown as { loginClicks: number }).loginClicks,
+        request: (window as unknown as { requestClicks?: number }).requestClicks,
+      })),
+    ).toEqual({ login: 1, request: undefined });
+    expect(requests).toEqual(['/login']);
+  }, 15_000);
   it('restored authentication goes AUTH_REQUIRED → DASHBOARD → PAUSED without course or video activity', async () => {
     await spaFixture({
       pageMarkup:

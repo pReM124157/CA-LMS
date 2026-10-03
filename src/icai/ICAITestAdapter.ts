@@ -83,27 +83,40 @@ export class ICAITestAdapter {
   private control(page: Page, name: RegExp): Promise<Locator | undefined> {
     return this.visible([page.getByRole('button', { name }), page.getByRole('link', { name })]);
   }
-  private async loginControl(page: Page): Promise<Locator | undefined> {
-    // getByText finds the smallest matching node, including Angular div/span content.
-    // Only these exact visible labels authorize a click; SSP is discovery-only.
-    const matches = page.getByText(/^\s*(?:login|log\s+in|sign\s+in|sign-in)\s+with\s+otp\s*$/i);
+  private loginControl(page: Page): Promise<Locator | undefined> {
+    return this.exactOtpControl(page, /^\s*(?:login|log\s+in|sign\s+in|sign-in)\s+with\s+otp\s*$/i);
+  }
+  private requestControl(page: Page): Promise<Locator | undefined> {
+    return this.exactOtpControl(page, /^\s*(?:generate|send|request|get)\s+otp\s*$/i);
+  }
+  private async exactOtpControl(page: Page, label: RegExp): Promise<Locator | undefined> {
+    // These allowlisted labels alone authorize the custom-element fallback.
+    // Prefer semantic controls across all candidates before returning exact text.
+    const matches = page.getByText(label);
+    let fallback: Locator | undefined;
     for (let index = 0; index < Math.min(await matches.count(), 40); index++) {
       let node = matches.nth(index);
       if (!(await node.isVisible())) continue;
+      const exact = await node.evaluate((element, source) => {
+        const text = (element as HTMLElement).innerText?.replace(/\s+/g, ' ').trim() ?? '';
+        return new RegExp(source, 'i').test(text);
+      }, label.source);
+      if (!exact) continue;
+      fallback ??= node;
       for (let depth = 0; depth <= 4; depth++) {
-        const allowed = await node.evaluate((element) => {
+        const allowed = await node.evaluate((element, source) => {
           const text = (element as HTMLElement).innerText?.replace(/\s+/g, ' ').trim() ?? '';
           return (
-            /^(?:login|log in|sign in|sign-in) with otp$/i.test(text) &&
+            new RegExp(source, 'i').test(text) &&
             element.matches('button, a, [role="button"], [role="link"], [tabindex="0"]')
           );
-        });
+        }, label.source);
         if (allowed && (await node.isVisible())) return node;
         node = node.locator('xpath=..');
         if (!(await node.count())) break;
       }
     }
-    return undefined;
+    return fallback;
   }
   async authenticated(page: Page): Promise<boolean> {
     this.assertOrigin(page, 'ICAI_LOGIN_NOT_CONFIRMED');
@@ -328,7 +341,7 @@ export class ICAITestAdapter {
         return this.missing(page, 'ICAI_OTP_UI_NOT_FOUND', [srn]);
       }
       await srnInput.fill(srn, { timeout });
-      const request = await this.control(page, /^(request|send|generate|get) (an? )?otp$/i);
+      const request = await this.requestControl(page);
       if (!request) {
         if (await this.authenticated(page)) return 'authenticated';
         return this.missing(page, 'ICAI_OTP_UI_NOT_FOUND', [srn]);
