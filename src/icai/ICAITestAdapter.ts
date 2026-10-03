@@ -15,6 +15,15 @@ export type LoginDiagnostics = {
   httpStatus?: number;
   pageTitle: string;
   relevantText: string[];
+  inputs: {
+    type: string;
+    name: string;
+    id: string;
+    placeholder: string;
+    ariaLabel: string;
+    autocomplete: string;
+    labelText: string;
+  }[];
   interactiveElements: {
     tagName: string;
     role: string;
@@ -62,14 +71,83 @@ export class ICAITestAdapter {
     }
     return undefined;
   }
-  private srn(page: Page): Promise<Locator | undefined> {
-    const name = /\bsrn\b|student registration (number|no)/i;
-    return this.visible([
-      page.getByRole('textbox', { name }),
-      page.getByLabel(name),
-      page.getByPlaceholder(name),
-      page.locator('input[name*="srn" i], input[id*="srn" i]'),
-    ]);
+  private async srn(page: Page, otpModeSelected = false): Promise<Locator | undefined> {
+    const inputs = page.locator('input');
+    const index = await inputs.evaluateAll((nodes, allowFallback) => {
+      // Fail closed rather than claiming uniqueness from a truncated input list.
+      if (nodes.length > 200) return -1;
+      const visible = (node: Element): boolean => {
+        const rect = node.getBoundingClientRect();
+        const style = getComputedStyle(node);
+        return (
+          rect.width > 0 &&
+          rect.height > 0 &&
+          style.visibility !== 'hidden' &&
+          style.visibility !== 'collapse' &&
+          style.display !== 'none'
+        );
+      };
+      const normalize = (text: string): string =>
+        text
+          .replace(/([a-z])([A-Z])/g, '$1 $2')
+          .replace(/[^a-z0-9]+/gi, ' ')
+          .trim();
+      const labels = (input: HTMLInputElement): string =>
+        Array.from(input.labels ?? [])
+          .filter(visible)
+          .map((label) => {
+            const walker = document.createTreeWalker(label, NodeFilter.SHOW_TEXT);
+            const parts: string[] = [];
+            while (walker.nextNode()) {
+              const parent = walker.currentNode.parentElement;
+              if (
+                parent &&
+                visible(parent) &&
+                !parent.closest('input, textarea, select, [contenteditable]')
+              )
+                parts.push(walker.currentNode.textContent ?? '');
+            }
+            return parts.join(' ');
+          })
+          .join(' ');
+      const candidates = nodes.flatMap((node, index) => {
+        const input = node as HTMLInputElement;
+        if (
+          !visible(input) ||
+          !['text', 'email', 'tel'].includes(input.type) ||
+          input.matches(':disabled') ||
+          input.readOnly ||
+          input.closest('[role="search"]')
+        )
+          return [];
+        const metadata = [
+          labels(input),
+          input.getAttribute('aria-label') ?? '',
+          input.placeholder,
+          input.name,
+          input.id,
+        ].map(normalize);
+        const evidence = [...metadata, input.autocomplete, input.getAttribute('role') ?? ''].join(
+          ' ',
+        );
+        if (/otp|one[ -]?time|verification\s+code|search|what do you want to learn/i.test(evidence))
+          return [];
+        return [{ index, metadata, form: input.closest('form, [role="form"]') }];
+      });
+      const srn =
+        /\bsrn\b|\b(?:student\s+)?registration(?:\s+(?:number|no))?\b|\buser(?:\s*name|\s*id)\b/i;
+      // Rank metadata sources globally, rather than taking the first matching DOM node.
+      for (let priority = 0; priority < 5; priority++) {
+        const match = candidates.find((candidate) => srn.test(candidate.metadata[priority] ?? ''));
+        if (match) return match.index;
+      }
+      if (!allowFallback) return -1;
+      const forms = Array.from(document.querySelectorAll('form, [role="form"]')).filter(visible);
+      if (forms.length !== 1) return -1;
+      const inForm = candidates.filter((candidate) => candidate.form === forms[0]);
+      return inForm.length === 1 ? inForm[0]!.index : -1;
+    }, otpModeSelected);
+    return index >= 0 ? inputs.nth(index) : undefined;
   }
   private otp(page: Page): Promise<Locator | undefined> {
     const name = /\botp\b|one[ -]?time (password|code)|verification code/i;
@@ -186,6 +264,22 @@ export class ICAITestAdapter {
       return {
         pageTitle: document.title.slice(0, 320),
         relevantText: [...snippets],
+        inputs: Array.from(document.querySelectorAll('input'))
+          .filter(visible)
+          .slice(0, 20)
+          .map((input) => ({
+            type: input.type,
+            name: input.name.slice(0, 320),
+            id: input.id.slice(0, 320),
+            placeholder: input.placeholder.slice(0, 320),
+            ariaLabel: (input.getAttribute('aria-label') ?? '').slice(0, 320),
+            autocomplete: input.autocomplete.slice(0, 320),
+            labelText: Array.from(input.labels ?? [])
+              .filter(visible)
+              .map(text)
+              .join(' ')
+              .slice(0, 320),
+          })),
         interactiveElements: Array.from(
           document.querySelectorAll('button, a, [role], [tabindex], [onclick]'),
         )
@@ -231,6 +325,15 @@ export class ICAITestAdapter {
       ...(this.entryStatus !== undefined ? { httpStatus: this.entryStatus } : {}),
       pageTitle: clean(raw.pageTitle),
       relevantText: raw.relevantText.map(clean),
+      inputs: raw.inputs.map((input) => ({
+        type: clean(input.type),
+        name: clean(input.name),
+        id: clean(input.id),
+        placeholder: clean(input.placeholder),
+        ariaLabel: clean(input.ariaLabel),
+        autocomplete: clean(input.autocomplete),
+        labelText: clean(input.labelText),
+      })),
       interactiveElements: raw.interactiveElements.map((node) => ({
         tagName: clean(node.tagName),
         role: clean(node.role),
@@ -331,7 +434,7 @@ export class ICAITestAdapter {
         const deadline = Date.now() + timeout;
         do {
           this.assertOrigin(page, 'ICAI_OTP_REQUEST_FAILED');
-          srnInput = await this.srn(page);
+          srnInput = await this.srn(page, true);
           if (srnInput) break;
           await page.waitForTimeout(200);
         } while (Date.now() < deadline);
@@ -341,7 +444,15 @@ export class ICAITestAdapter {
         return this.missing(page, 'ICAI_OTP_UI_NOT_FOUND', [srn]);
       }
       await srnInput.fill(srn, { timeout });
-      const request = await this.requestControl(page);
+      let request: Locator | undefined;
+      const requestDeadline = Date.now() + timeout;
+      do {
+        this.assertOrigin(page, 'ICAI_OTP_REQUEST_FAILED');
+        if (await this.otp(page)) return 'otp_required';
+        request = await this.requestControl(page);
+        if (request) break;
+        await page.waitForTimeout(200);
+      } while (Date.now() < requestDeadline);
       if (!request) {
         if (await this.authenticated(page)) return 'authenticated';
         return this.missing(page, 'ICAI_OTP_UI_NOT_FOUND', [srn]);

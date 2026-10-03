@@ -87,10 +87,13 @@ const spaFixture = async (
     controlMarkup?: string;
     pageMarkup?: string;
     requestMarkup?: string;
+    fieldMarkup?: string;
+    onRequest?: (body: string) => void;
   } = {},
 ): Promise<void> => {
   const form =
-    '<form id="srn-form" action="/request" method="post" hidden><label>SRN<input name="srn"></label>' +
+    '<form id="srn-form" action="/request" method="post" hidden>' +
+    (options.fieldMarkup ?? '<label>SRN<input name="srn"></label>') +
     (options.requestMarkup ?? '<button>Generate OTP</button>') +
     '</form>';
   const button =
@@ -105,12 +108,14 @@ const spaFixture = async (
         status: 302,
         headers: { location: 'https://outside.example.test/escape' },
       });
-    if (url.pathname === '/request')
+    if (url.pathname === '/request') {
+      options.onRequest?.(route.request().postData() ?? '');
       return route.fulfill({
         status: 200,
         contentType: 'text/html',
         body: '<label>OTP<input name="otp"></label><button>Verify OTP</button>',
       });
+    }
     const root = url.pathname === '/';
     const status = (root ? options.rootStatus : options.loginStatus) ?? 200;
     const empty = root ? options.rootEmpty : options.loginEmpty;
@@ -235,6 +240,159 @@ describe('controlled ICAI browser and OTP API fixtures', () => {
     ).toEqual({ login: 1, request: undefined });
     expect(requests).toEqual(['/login']);
   }, 15_000);
+  it.each([
+    '<label>Student Registration Number<input name="candidate"></label>',
+    '<label>Registration No<input name="candidate"></label>',
+    '<label>Username<input name="candidate"></label>',
+    '<input name="candidate" aria-label="User Name">',
+    '<input name="candidate" placeholder="User ID">',
+    '<input name="registrationNo">',
+    '<input name="candidate" id="UserID">',
+  ])('recognizes SRN safely from ranked metadata: %s', async (fieldMarkup) => {
+    const requested = vi.fn();
+    await spaFixture({ fieldMarkup, onRequest: requested });
+    const runner = new Runner();
+    await runner.start();
+    expect(runner.status()).toMatchObject({ state: 'OTP_REQUIRED', active: false });
+    expect(requested).toHaveBeenCalledOnce();
+    expect(
+      new URLSearchParams(requested.mock.calls[0]![0]).get(
+        fieldMarkup.includes('name="registrationNo"') ? 'registrationNo' : 'candidate',
+      ),
+    ).toBe('ABC1234567');
+    expect(requests).toEqual(['/', '/request']);
+  });
+  it.each([
+    '<input type="search" name="Username" value="search-value">',
+    '<input type="text" name="search" aria-label="Username" value="search-value">',
+    '<input type="password" name="Username" value="password-value">',
+    '<input name="otp" aria-label="Username" autocomplete="one-time-code" value="otp-value">',
+    '<input name="Username" disabled value="disabled-value">',
+    '<input type="hidden" name="Username" value="hidden-value">',
+  ])('ignores ineligible inputs even with SRN-like metadata: %s', async (other) => {
+    const requested = vi.fn();
+    await spaFixture({
+      fieldMarkup: other + '<label>Student Registration Number<input name="srn"></label>',
+      onRequest: requested,
+    });
+    expect(
+      await new ICAITestAdapter(500).requestOtp(page, 'https://lms.icai.org/login', 'ABC1234567'),
+    ).toBe('otp_required');
+    if (requested.mock.calls.length) {
+      const body = new URLSearchParams(requested.mock.calls[0]![0]);
+      expect(body.get('srn')).toBe('ABC1234567');
+      for (const [name, value] of body) if (name !== 'srn') expect(value).not.toBe('ABC1234567');
+    } else {
+      // An existing normal OTP input is observed without submitting it.
+      expect(await page.locator('input[name=srn]').inputValue()).toBe('ABC1234567');
+      expect(await page.locator('input[name=otp]').inputValue()).toBe('otp-value');
+    }
+  });
+  it('prefers associated label evidence to an earlier name match', async () => {
+    const requested = vi.fn();
+    await spaFixture({
+      fieldMarkup: '<input name="Username"><label>Registration No<input name="candidate"></label>',
+      onRequest: requested,
+    });
+    await new ICAITestAdapter(500).requestOtp(page, 'https://lms.icai.org/login', 'ABC1234567');
+    const body = new URLSearchParams(requested.mock.calls[0]![0]);
+    expect(body.get('candidate')).toBe('ABC1234567');
+    expect(body.get('Username')).toBe('');
+  });
+  it('uses exactly one eligible unlabelled form field only after selecting OTP mode', async () => {
+    const requested = vi.fn();
+    await spaFixture({
+      fieldMarkup:
+        '<h2>LOGIN</h2><input name="candidate"><input type="search"><input type="password"><input disabled><input hidden>',
+      onRequest: requested,
+    });
+    const runner = new Runner();
+    await runner.start();
+    expect(runner.status()).toMatchObject({ state: 'OTP_REQUIRED', active: false });
+    expect(new URLSearchParams(requested.mock.calls[0]![0]).get('candidate')).toBe('ABC1234567');
+    expect(requests).toEqual(['/', '/request']);
+  });
+  it('rejects a two-field fallback after OTP selection without filling or clicking request', async () => {
+    const click = vi.spyOn(Object.getPrototypeOf(page.locator('body')), 'click');
+    await spaFixture({ fieldMarkup: '<h2>LOGIN</h2><input name="first"><input name="second">' });
+    await expect(
+      new ICAITestAdapter(300).requestOtp(page, 'https://lms.icai.org/login', 'ABC1234567'),
+    ).rejects.toMatchObject({ code: 'ICAI_OTP_UI_NOT_FOUND' });
+    expect(click).toHaveBeenCalledExactlyOnceWith({ timeout: 10_000 });
+    expect(await page.locator('input[name=first]').inputValue()).toBe('');
+    expect(await page.locator('input[name=second]').inputValue()).toBe('');
+    expect(requests).toEqual(['/login']);
+  }, 15_000);
+  it('never uses an unlabelled single-field fallback before selecting OTP mode', async () => {
+    await spaFixture({
+      pageMarkup:
+        '<h1>ICAI Digital Learning Campus</h1><form><h2>LOGIN</h2><input name="candidate"><button>Generate OTP</button></form>',
+    });
+    await expect(
+      new ICAITestAdapter(300).requestOtp(page, 'https://lms.icai.org/login', 'ABC1234567'),
+    ).rejects.toMatchObject({ code: 'ICAI_OTP_UI_NOT_FOUND' });
+    expect(await page.locator('input').inputValue()).toBe('');
+    expect(requests).toEqual(['/login']);
+  });
+  it('waits for a delayed exact Generate OTP control after SRN fill', async () => {
+    await spaFixture({
+      fieldMarkup:
+        '<label>SRN<input name="srn" oninput="setTimeout(()=>document.getElementById(\'request-slot\').innerHTML=\'<button>Generate OTP</button>\',350)"></label>',
+      requestMarkup: '<div id="request-slot"></div>',
+    });
+    const runner = new Runner();
+    await runner.start();
+    expect(runner.status()).toMatchObject({ state: 'OTP_REQUIRED', active: false });
+    expect(requests).toEqual(['/', '/request']);
+  });
+  it('stops at OTP_REQUIRED when OTP appears directly after filling SRN', async () => {
+    const click = vi.spyOn(Object.getPrototypeOf(page.locator('body')), 'click');
+    await spaFixture({
+      fieldMarkup:
+        '<label>Username<input name="srn" oninput="setTimeout(()=>document.getElementById(\'srn-form\').innerHTML=\'<label>OTP<input name=otp autocomplete=one-time-code></label><button>Verify OTP</button>\',350)"></label>',
+      requestMarkup: '',
+    });
+    const runner = new Runner();
+    await runner.start();
+    expect(runner.status()).toMatchObject({ state: 'OTP_REQUIRED', active: false });
+    expect(shared.log.mock.calls.map(([event]) => `${event.from}->${event.to}`).at(-1)).toBe(
+      'AUTH_REQUIRED->OTP_REQUIRED',
+    );
+    expect(await page.locator('input[name=otp]').inputValue()).toBe('');
+    expect(click).toHaveBeenCalledExactlyOnceWith({ timeout: 10_000 });
+    await runner.resume();
+    expect(requests).toEqual(['/']);
+    expect(shared.write).not.toHaveBeenCalled();
+  });
+  it('bounds visible input diagnostics and redacts metadata without reading values', async () => {
+    await spaFixture({
+      pageMarkup:
+        '<h1>ICAI Digital Learning Campus</h1><label>Help ABC1234567<input type="text" name="unknown" id="ABC1234567" placeholder="654321" aria-label="token=diagnostic-secret" autocomplete="off" value="private-value"></label><input hidden value="hidden-value">' +
+        Array.from({ length: 25 }, (_, i) => `<input name="field-${i}" value="private-${i}">`).join(
+          '',
+        ),
+    });
+    let failure: unknown;
+    try {
+      await new ICAITestAdapter(300).requestOtp(page, 'https://lms.icai.org/login', 'ABC1234567');
+    } catch (error) {
+      failure = error;
+    }
+    const diagnostic = (failure as { diagnostic: { inputs: Record<string, string>[] } }).diagnostic;
+    expect(diagnostic.inputs).toHaveLength(20);
+    expect(diagnostic.inputs[0]).toEqual({
+      type: 'text',
+      name: 'unknown',
+      id: '[REDACTED]',
+      placeholder: '[REDACTED]',
+      ariaLabel: '[REDACTED]',
+      autocomplete: 'off',
+      labelText: 'Help [REDACTED]',
+    });
+    expect(JSON.stringify(failure)).not.toMatch(
+      /ABC1234567|654321|private-|hidden-value|diagnostic-secret|defaultValue|"value"/,
+    );
+  });
   it('restored authentication goes AUTH_REQUIRED → DASHBOARD → PAUSED without course or video activity', async () => {
     await spaFixture({
       pageMarkup:
@@ -327,6 +485,7 @@ describe('controlled ICAI browser and OTP API fixtures', () => {
     expect(Object.keys(diagnostic).sort()).toEqual([
       'finalPathname',
       'httpStatus',
+      'inputs',
       'interactiveElements',
       'pageTitle',
       'relevantText',
@@ -502,7 +661,7 @@ describe('controlled ICAI browser and OTP API fixtures', () => {
     expect(JSON.stringify(diagnostic)).not.toMatch(
       /ABC1234567|654321|private-value|browser-token-secret/,
     );
-  });
+  }, 15_000);
   it('blocks cross-origin redirects before reaching the destination', async () => {
     await fixture('/login');
     const adapter = new ICAITestAdapter();
