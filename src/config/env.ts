@@ -50,7 +50,7 @@ export const envSchema = z
           const url = new URL(value);
           return url.origin === 'https://lms.icai.org' && !url.username && !url.password;
         }, 'must stay on the ICAI HTTPS origin')
-        .default('https://lms.icai.org/login'),
+        .default('https://lms.icai.org/'),
     ),
     ICAI_SRN: z.preprocess(
       (value) => (value === '' ? undefined : value),

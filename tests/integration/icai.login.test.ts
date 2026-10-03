@@ -50,7 +50,7 @@ const fixture = async (path: string): Promise<void> => {
     requests.push(url.pathname);
     if (url.origin !== 'https://lms.icai.org') return route.abort();
     let body = '';
-    if (url.pathname === '/login')
+    if (url.pathname === '/login' || url.pathname === '/')
       body =
         '<h1>Login</h1><form action=/request method=post><label>Student Registration Number<input name=srn></label><button>Send OTP</button></form>';
     if (url.pathname === '/request')
@@ -65,7 +65,7 @@ const fixture = async (path: string): Promise<void> => {
     }
     if (url.pathname === '/missing')
       body =
-        '<label>SRN ABC1234567<input type=text name=unknown placeholder="Unknown ABC1234567" value="private-value"></label><button>Help 654321</button><script>localStorage.setItem("private","browser-token-secret")</script>';
+        '<h1>ICAI Digital Learning Campus</h1><label>SRN ABC1234567<input type=text name=unknown placeholder="Unknown ABC1234567" value="private-value"></label><button>Help 654321</button><script>localStorage.setItem("private","browser-token-secret")</script>';
     if (url.pathname === '/escape')
       return route.fulfill({
         status: 302,
@@ -75,6 +75,48 @@ const fixture = async (path: string): Promise<void> => {
   });
   // No live network requests: every request in this context is intercepted above.
   if (path !== '/login') await page.goto(`https://lms.icai.org${path}`);
+};
+const spaFixture = async (
+  options: {
+    loginStatus?: number;
+    rootStatus?: number;
+    loginEmpty?: boolean;
+    rootEmpty?: boolean;
+    delayMs?: number;
+    escape?: boolean;
+  } = {},
+): Promise<void> => {
+  const form =
+    '<form id="srn-form" action="/request" method="post" hidden><label>SRN<input name="srn"></label><button>Generate OTP</button></form>';
+  const button =
+    '<button onclick="document.getElementById(\'srn-form\').hidden=false;this.hidden=true">Login with OTP</button>';
+  await context.route('**/*', async (route) => {
+    const url = new URL(route.request().url());
+    requests.push(url.pathname);
+    if (url.origin !== 'https://lms.icai.org') return route.abort();
+    if (options.escape && url.pathname === '/login')
+      return route.fulfill({
+        status: 302,
+        headers: { location: 'https://outside.example.test/escape' },
+      });
+    if (url.pathname === '/request')
+      return route.fulfill({
+        status: 200,
+        contentType: 'text/html',
+        body: '<label>OTP<input name="otp"></label><button>Verify OTP</button>',
+      });
+    const root = url.pathname === '/';
+    const status = (root ? options.rootStatus : options.loginStatus) ?? 200;
+    const empty = root ? options.rootEmpty : options.loginEmpty;
+    const rendered = options.delayMs
+      ? `${form}<h1>ICAI Digital Learning Campus</h1><div id="spa"></div><script>setTimeout(()=>document.getElementById('spa').innerHTML=${JSON.stringify(button)},${options.delayMs})</script>`
+      : form + button;
+    const body =
+      status >= 300 || empty
+        ? '<input name="unknown-ABC1234567" placeholder="ABC1234567" value="654321"><button>Help ABC1234567</button>'
+        : rendered;
+    await route.fulfill({ status, contentType: 'text/html', body });
+  });
 };
 describe('controlled ICAI browser and OTP API fixtures', () => {
   beforeAll(async () => {
@@ -93,6 +135,70 @@ describe('controlled ICAI browser and OTP API fixtures', () => {
   });
   afterEach(async () => {
     await context.close();
+  });
+  it('/login non-2xx falls back once to the root SPA and requests OTP normally', async () => {
+    await spaFixture({ loginStatus: 404 });
+    await new ICAITestAdapter().requestOtp(page, 'https://lms.icai.org/login', 'ABC1234567');
+    expect(requests).toEqual(['/login', '/', '/request']);
+    expect(await page.locator('input[name=otp]').isVisible()).toBe(true);
+  });
+  it('root SPA loads without visiting /login', async () => {
+    await spaFixture();
+    await new ICAITestAdapter().requestOtp(page, 'https://lms.icai.org/', 'ABC1234567');
+    expect(requests).toEqual(['/', '/request']);
+  });
+  it('waits for delayed SPA controls rather than failing at domcontentloaded', async () => {
+    await spaFixture({ delayMs: 750 });
+    const started = Date.now();
+    await new ICAITestAdapter().requestOtp(page, 'https://lms.icai.org/', 'ABC1234567');
+    expect(Date.now() - started).toBeGreaterThanOrEqual(700);
+    expect(requests).toEqual(['/', '/request']);
+  });
+  it('/login without application content falls back once to a rendered root', async () => {
+    await spaFixture({ loginEmpty: true });
+    await new ICAITestAdapter(500).requestOtp(page, 'https://lms.icai.org/login', 'ABC1234567');
+    expect(requests).toEqual(['/login', '/', '/request']);
+  });
+  it('failed HTTP fallback never loops and exposes only sanitized final diagnostics', async () => {
+    await spaFixture({ loginStatus: 404, rootStatus: 503 });
+    let failure: unknown;
+    try {
+      await new ICAITestAdapter().requestOtp(
+        page,
+        'https://lms.icai.org/login?srn=ABC1234567',
+        'ABC1234567',
+      );
+    } catch (error) {
+      failure = error;
+    }
+    expect(requests).toEqual(['/login', '/']);
+    expect(failure).toMatchObject({
+      code: 'ICAI_LOGIN_HTTP_ERROR',
+      diagnostic: {
+        finalPathname: '/',
+        httpStatus: 503,
+        inputs: [{ name: 'unknown-[REDACTED]', id: '', placeholder: '[REDACTED]' }],
+        controls: ['Help [REDACTED]'],
+      },
+    });
+    expect(JSON.stringify(failure)).not.toMatch(/ABC1234567|654321|srn=/);
+  });
+  it('unrendered fallback stops with APP_NOT_RENDERED and never loops', async () => {
+    await spaFixture({ loginEmpty: true, rootEmpty: true });
+    await expect(
+      new ICAITestAdapter(500).requestOtp(page, 'https://lms.icai.org/login', 'ABC1234567'),
+    ).rejects.toMatchObject({
+      code: 'ICAI_LOGIN_APP_NOT_RENDERED',
+      diagnostic: { finalPathname: '/', httpStatus: 200 },
+    });
+    expect(requests).toEqual(['/login', '/']);
+  });
+  it('a cross-origin /login redirect fails without falling back or reaching that origin', async () => {
+    await spaFixture({ escape: true });
+    await expect(
+      new ICAITestAdapter().requestOtp(page, 'https://lms.icai.org/login', 'ABC1234567'),
+    ).rejects.toMatchObject({ code: 'ICAI_LOGIN_PAGE_UNAVAILABLE' });
+    expect(requests).toEqual(['/login']);
   });
   it('requires Basic Auth, validates OTP, and stops authenticated login before any lecture or media', async () => {
     await fixture('/login');
@@ -137,13 +243,13 @@ describe('controlled ICAI browser and OTP API fixtures', () => {
       expect(JSON.stringify(result)).not.toMatch(/ABC1234567|654321/);
       expect(JSON.stringify(shared.log.mock.calls)).not.toMatch(/ABC1234567|654321/);
       expect(shared.write).not.toHaveBeenCalled();
-      expect(requests).toEqual(['/login', '/request', '/verify']);
+      expect(requests).toEqual(['/', '/request', '/verify']);
       expect(
         await page.evaluate(() => (window as unknown as { mediaPlays: number }).mediaPlays),
       ).toBe(0);
       await expect(runner.confirm('b')).rejects.toMatchObject({ code: 'QUESTION_FLOW_DISABLED' });
       await runner.resume();
-      expect(requests).toEqual(['/login', '/request', '/verify']);
+      expect(requests).toEqual(['/', '/request', '/verify']);
     } finally {
       if (server) await new Promise<void>((resolve) => server!.close(() => resolve()));
     }
@@ -160,7 +266,7 @@ describe('controlled ICAI browser and OTP API fixtures', () => {
     });
     expect(await page.locator('input[name=otp]').inputValue()).toBe('');
     await runner.resume();
-    expect(requests).toEqual(['/login', '/request', '/verify']);
+    expect(requests).toEqual(['/', '/request', '/verify']);
     const errors = shared.log.mock.calls.filter(([event]) => event.to === 'ERROR');
     expect(errors).toHaveLength(1);
     expect(JSON.stringify([runner.status(), shared.log.mock.calls])).not.toMatch(
@@ -169,7 +275,7 @@ describe('controlled ICAI browser and OTP API fixtures', () => {
   });
   it('diagnoses missing selectors without values, SRN, OTP, or browser storage', async () => {
     await fixture('/missing');
-    const adapter = new ICAITestAdapter();
+    const adapter = new ICAITestAdapter(500);
     let diagnostic: unknown;
     try {
       await adapter.requestOtp(page, 'https://lms.icai.org/missing', 'ABC1234567');
@@ -178,7 +284,7 @@ describe('controlled ICAI browser and OTP API fixtures', () => {
     }
     expect(diagnostic).toMatchObject({
       code: 'ICAI_OTP_UI_NOT_FOUND',
-      diagnostic: { inputs: [{ type: 'text', name: 'unknown', id: '' }] },
+      diagnostic: { inputs: [{ name: 'unknown', id: '' }] },
     });
     expect(JSON.stringify(diagnostic)).not.toMatch(
       /ABC1234567|654321|private-value|browser-token-secret/,

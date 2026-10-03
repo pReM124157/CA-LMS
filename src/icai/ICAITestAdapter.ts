@@ -3,13 +3,17 @@ import type { Locator, Page, Route } from 'playwright';
 export const ICAI_ORIGIN = 'https://lms.icai.org';
 export type ICAIErrorCode =
   | 'ICAI_LOGIN_PAGE_UNAVAILABLE'
+  | 'ICAI_LOGIN_HTTP_ERROR'
+  | 'ICAI_LOGIN_APP_NOT_RENDERED'
   | 'ICAI_OTP_UI_NOT_FOUND'
   | 'ICAI_OTP_REQUEST_FAILED'
   | 'ICAI_OTP_INPUT_NOT_FOUND'
   | 'ICAI_OTP_REJECTED'
   | 'ICAI_LOGIN_NOT_CONFIRMED';
 export type LoginDiagnostics = {
-  inputs: { type: string; name: string; id: string; placeholder: string; labels: string[] }[];
+  finalPathname: string;
+  httpStatus?: number;
+  inputs: { name: string; id: string; placeholder: string }[];
   controls: string[];
 };
 export class ICAILoginError extends Error {
@@ -25,6 +29,8 @@ export const validOtp = (otp: unknown): otp is string =>
 const timeout = 10_000;
 
 export class ICAITestAdapter {
+  constructor(private readonly spaReadyTimeoutMs = 15_000) {}
+  private entryStatus?: number;
   private guarded?: Page;
   private escaped = false;
   private readonly guardRoute = async (route: Route): Promise<void> => {
@@ -75,16 +81,21 @@ export class ICAITestAdapter {
       inputs: Array.from(document.querySelectorAll('input'))
         .slice(0, 30)
         .map((input) => ({
-          type: input.type,
           name: input.name,
           id: input.id,
           placeholder: input.placeholder,
-          labels: Array.from(input.labels ?? []).map((label) =>
-            (label.textContent ?? '').slice(0, 160),
-          ),
         })),
       controls: Array.from(document.querySelectorAll('button, a, input[type="submit"]'))
-        .filter((node) => (node as HTMLElement).getBoundingClientRect().width > 0)
+        .filter((node) => {
+          const rect = node.getBoundingClientRect();
+          const style = getComputedStyle(node);
+          return (
+            rect.width > 0 &&
+            rect.height > 0 &&
+            style.visibility !== 'hidden' &&
+            style.display !== 'none'
+          );
+        })
         .slice(0, 30)
         .map((node) => (node.textContent ?? node.getAttribute('aria-label') ?? '').slice(0, 160)),
     }));
@@ -96,12 +107,12 @@ export class ICAITestAdapter {
         .slice(0, 160);
     };
     return {
+      finalPathname: clean(new URL(page.url()).pathname),
+      ...(this.entryStatus !== undefined ? { httpStatus: this.entryStatus } : {}),
       inputs: raw.inputs.map((input) => ({
-        type: clean(input.type),
         name: clean(input.name),
         id: clean(input.id),
         placeholder: clean(input.placeholder),
-        labels: input.labels.map(clean),
       })),
       controls: raw.controls.map(clean),
     };
@@ -110,9 +121,39 @@ export class ICAITestAdapter {
     this.assertOrigin(page, code);
     throw new ICAILoginError(code, await this.diagnostics(page, secrets).catch(() => undefined));
   }
+  private async waitForApp(page: Page): Promise<boolean> {
+    const deadline = Date.now() + this.spaReadyTimeoutMs;
+    do {
+      this.assertOrigin(page, 'ICAI_LOGIN_PAGE_UNAVAILABLE');
+      if (
+        (await this.srn(page)) ||
+        (await this.visible([
+          page.getByText(/login with otp|sign in with ssp|(?:ICAI\s+)?digital learning campus/i),
+        ]))
+      )
+        return true;
+      await page.waitForTimeout(250);
+    } while (Date.now() < deadline);
+    return false;
+  }
+  private async openEntry(page: Page, url: string, srn: string): Promise<void> {
+    this.entryStatus = undefined;
+    try {
+      const response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 20_000 });
+      this.assertOrigin(page, 'ICAI_LOGIN_PAGE_UNAVAILABLE');
+      this.entryStatus = response?.status();
+      if (response && !response.ok()) return this.missing(page, 'ICAI_LOGIN_HTTP_ERROR', [srn]);
+      if (!(await this.waitForApp(page)))
+        return this.missing(page, 'ICAI_LOGIN_APP_NOT_RENDERED', [srn]);
+    } catch (error) {
+      if (error instanceof ICAILoginError) throw error;
+      throw new ICAILoginError('ICAI_LOGIN_PAGE_UNAVAILABLE');
+    }
+  }
   async requestOtp(page: Page, loginUrl: string, srn: string): Promise<void> {
     try {
-      if (new URL(loginUrl).origin !== ICAI_ORIGIN)
+      const entry = new URL(loginUrl);
+      if (entry.origin !== ICAI_ORIGIN || entry.username || entry.password)
         throw new ICAILoginError('ICAI_LOGIN_PAGE_UNAVAILABLE');
       if (this.guarded !== page) {
         // Context routing also guards the first navigation of any popup.
@@ -123,19 +164,35 @@ export class ICAITestAdapter {
         });
       }
       this.escaped = false;
-      const response = await page.goto(loginUrl, {
-        waitUntil: 'domcontentloaded',
-        timeout: 20_000,
-      });
-      this.assertOrigin(page, 'ICAI_LOGIN_PAGE_UNAVAILABLE');
-      if (response && !response.ok()) throw new ICAILoginError('ICAI_LOGIN_PAGE_UNAVAILABLE');
-    } catch {
+      try {
+        await this.openEntry(page, loginUrl, srn);
+      } catch (error) {
+        if (
+          !this.escaped &&
+          entry.pathname.replace(/\/$/, '') === '/login' &&
+          error instanceof ICAILoginError &&
+          (error.code === 'ICAI_LOGIN_HTTP_ERROR' || error.code === 'ICAI_LOGIN_APP_NOT_RENDERED')
+        ) {
+          // One explicit retry at the canonical root; no recursive fallback.
+          await this.openEntry(page, `${ICAI_ORIGIN}/`, srn);
+        } else throw error;
+      }
+    } catch (error) {
+      if (error instanceof ICAILoginError) throw error;
       throw new ICAILoginError('ICAI_LOGIN_PAGE_UNAVAILABLE');
     }
     try {
-      let srnInput = await this.srn(page);
-      const switchControl = await this.control(page, /^(login|sign in) (with|via) otp$/i);
-      if (!srnInput && switchControl) {
+      let srnInput: Locator | undefined;
+      let switchControl: Locator | undefined;
+      const controlsDeadline = Date.now() + this.spaReadyTimeoutMs;
+      do {
+        this.assertOrigin(page, 'ICAI_OTP_REQUEST_FAILED');
+        switchControl = await this.control(page, /^(login|sign in) (with|via) otp$/i);
+        srnInput = await this.srn(page);
+        if (switchControl || srnInput) break;
+        await page.waitForTimeout(250);
+      } while (Date.now() < controlsDeadline);
+      if (switchControl) {
         await switchControl.click({ timeout });
         this.assertOrigin(page, 'ICAI_OTP_REQUEST_FAILED');
         const deadline = Date.now() + timeout;
@@ -148,29 +205,14 @@ export class ICAITestAdapter {
       }
       if (!srnInput) return this.missing(page, 'ICAI_OTP_UI_NOT_FOUND', [srn]);
       await srnInput.fill(srn, { timeout });
-      const request = await this.control(
-        page,
-        /^(request|send|generate|get) (an? )?otp$|^(login|sign in) (with|via) otp$/i,
-      );
+      const request = await this.control(page, /^(request|send|generate|get) (an? )?otp$/i);
       if (!request) return this.missing(page, 'ICAI_OTP_UI_NOT_FOUND', [srn]);
       this.assertOrigin(page, 'ICAI_OTP_REQUEST_FAILED');
-      const requestName =
-        (await request.textContent()) ?? (await request.getAttribute('aria-label')) ?? '';
-      let requestSent = !/^(login|sign in) (with|via) otp$/i.test(requestName.trim());
       await request.click({ timeout });
       const deadline = Date.now() + timeout;
       while (Date.now() < deadline) {
         this.assertOrigin(page, 'ICAI_OTP_REQUEST_FAILED');
         if (await this.otp(page)) return;
-        if (!requestSent) {
-          const send = await this.control(page, /^(request|send|generate|get) (an? )?otp$/i);
-          if (send) {
-            const currentSrn = await this.srn(page);
-            if (currentSrn) await currentSrn.fill(srn, { timeout });
-            await send.click({ timeout });
-            requestSent = true;
-          }
-        }
         await page.waitForTimeout(200);
       }
       return this.missing(page, 'ICAI_OTP_INPUT_NOT_FOUND', [srn]);

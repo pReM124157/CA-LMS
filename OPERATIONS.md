@@ -31,7 +31,7 @@ for controlled compatibility testing only.
 ### ICAI login-only compatibility canary
 
 Set `TARGET_MODE=icai_test`, `ICAI_SRN` to your authorized SRN, and optionally
-`ICAI_LOGIN_URL` (default `https://lms.icai.org/login`). The URL must use exactly
+`ICAI_LOGIN_URL` (default `https://lms.icai.org/`). The URL must use exactly
 the `https://lms.icai.org` origin without embedded credentials. This mode forces
 `AUTO_SUBMIT=false` and `REQUIRE_HUMAN_CONFIRMATION=true` regardless of configured
 values. It uses the existing browser backend, including Browserless CDP.
@@ -60,8 +60,9 @@ or an unconfirmed login fail after bounded waits. Restart the service for a new
 attempt after a terminal error.
 
 Status exposes only `icai.stage`, `srnConfigured`, `loginOrigin`, structured error
-codes, and (only when controls are missing) bounded diagnostic metadata. Diagnostics
-contain input type/name/id/placeholder/associated labels and visible control text,
+codes, and bounded diagnostic metadata for entry or missing-control failures. Diagnostics
+contain sanitized final pathname, available HTTP status, input name/id/placeholder,
+and visible button/link text,
 with configured SRN/OTP and recognizable numeric secrets redacted. They never read
 input values, cookies, headers, or browser storage. Raw Playwright errors are not
 returned or logged. SRN/OTP fields are also covered by logger redaction.
@@ -69,3 +70,17 @@ returned or logged. SRN/OTP fields are also covered by logger redaction.
 The automated ICAI tests use intercepted browser fixtures and send no live OTP
 requests. Real ICAI layout and live authentication require a separate authorized
 operator canary; they are not established by the fixture tests.
+
+ICAI entry navigation now defaults to `https://lms.icai.org/`. An explicitly
+configured `/login` gets one fallback to `/` if its HTTP response is non-2xx or
+its application does not render. Origin violations fail immediately, without
+fallback. SPA readiness is polled every 250 ms for up to 15 seconds per entry,
+using visible Login with OTP, Sign in with SSP, SRN inputs, or Digital Learning
+Campus content. Selecting Login with OTP then waits for SRN before using the
+normal Generate/Send/Request OTP control.
+
+Entry failures distinguish `ICAI_LOGIN_HTTP_ERROR` from
+`ICAI_LOGIN_APP_NOT_RENDERED`; missing controls and request failures retain their
+separate OTP codes. Diagnostics expose only sanitized final pathname, available
+HTTP status, visible button/link text, and input id/name/placeholder. Query strings,
+input values, input types, and associated labels are omitted.

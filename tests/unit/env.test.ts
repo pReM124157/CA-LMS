@@ -14,7 +14,7 @@ describe('environment validation', () => {
         REQUIRE_HUMAN_CONFIRMATION: 'false',
       }),
     ).toMatchObject({
-      ICAI_LOGIN_URL: 'https://lms.icai.org/login',
+      ICAI_LOGIN_URL: 'https://lms.icai.org/',
       AUTO_SUBMIT: false,
       REQUIRE_HUMAN_CONFIRMATION: true,
     }));
