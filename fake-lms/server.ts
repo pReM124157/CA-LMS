@@ -1,7 +1,14 @@
 import express from 'express';
+import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 const app = express(); app.use(express.urlencoded({ extended: false }));
 app.use('/media', express.static(fileURLToPath(new URL('./public', import.meta.url))));
+app.get('/hls.js', (_req, res) => res.sendFile(createRequire(import.meta.url).resolve('hls.js/dist/hls.min.js')));
+app.get('/hls-test', (_req, res) => {
+  res.setHeader('Referrer-Policy', 'no-referrer');
+  res.setHeader('Content-Security-Policy', "default-src 'self'; script-src 'self'; connect-src https:; media-src 'self' https: blob:; worker-src blob:; style-src 'self' 'unsafe-inline'");
+  res.send(layout('<h1>Controlled HLS playback canary</h1><video controls muted playsinline width=640></video><script src="/hls.js"></script><script src="/media/hls-test.js"></script>'));
+});
 const layout = (body: string) => `<!doctype html><html><head><title>Fake LMS</title><style>body{font:16px system-ui;max-width:900px;margin:2rem auto}.question{position:fixed;inset:20%;background:#fff;border:2px solid #222;padding:2rem;box-shadow:0 2px 24px #555}label{display:block;margin:.6rem}</style></head><body>${body}</body></html>`;
 app.get('/login', (_req, res) => res.send(layout('<h1>Fake LMS Login</h1><form method="post"><input name="email" value="student@example.test"><button>Sign in</button></form>')));
 app.post('/login', (_req, res) => res.redirect('/'));
